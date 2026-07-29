@@ -1,0 +1,19 @@
+# === UI 框架 ===
+PySide6==6.8.2.1
+monkeyqt==0.1.5
+
+# === PDF 渲染 ===
+PyMuPDF==1.24.14
+
+# === OCR ===
+paddleocr>=3.7.0,<4.0
+
+# === 图像/工具 ===
+Pillow>=10.0.0
+numpy>=1.26,<3.0
+
+# 注意：paddlepaddle 需单独安装，不写入此文件以避免 pip 解析 GPU 索引
+# CPU 主路径（推荐）：
+#   python -m pip install paddlepaddle==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+# 可选 GPU 路径：
+#   python -m pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/

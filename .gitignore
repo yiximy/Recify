@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 项目数据（用户运行时生成）
+data/store.json
+config/app_config.json
+cache/
+logs/
+
+# 操作系统
+Thumbs.db
+.DS_Store
+
+# Claude / Trae
+.trae/
+.claude/
