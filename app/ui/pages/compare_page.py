@@ -8,9 +8,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QInputDialog,
+    QDialog,
 )
 from monkeyqt import MkButton, MkMessage
 
+from app.ui.widgets.auto_match_dialog import AutoMatchDialog
 from app.ui.widgets.file_list_panel import FileListPanel
 from app.ui.widgets.preview_view import PreviewView
 from app.ui.widgets.toggle_switch import ToggleSwitch
@@ -40,7 +42,6 @@ class ComparePage(QWidget):
 
         # 自动比对状态
         self._match_pairs: list[dict] = []     # 待处理的匹配对列表
-        self._current_match_idx: int = -1      # 当前处理到的匹配对索引
         self._review_mode: bool = True         # 是否审阅模式（默认开启）
 
     def _build_ui(self):
@@ -124,6 +125,23 @@ class ComparePage(QWidget):
         """连接信号。"""
         self.invoice_panel.fileSelected.connect(self._on_invoice_selected)
         self.payment_panel.fileSelected.connect(self._on_payment_selected)
+        self.invoice_panel.locateAllRequested.connect(
+            self._on_locate_all_from_invoice
+        )
+        self.payment_panel.locateAllRequested.connect(
+            self._on_locate_all_from_payment
+        )
+        self.invoice_panel.locateFileRequested.connect(
+            self._on_locate_file_from_invoice
+        )
+        self.payment_panel.locateFileRequested.connect(
+            self._on_locate_file_from_payment
+        )
+
+        self.invoice_panel.selectionChanged.connect(self._update_link_buttons)
+        self.payment_panel.selectionChanged.connect(self._update_link_buttons)
+        self.invoice_panel.combosChanged.connect(self._on_combos_changed)
+        self.payment_panel.combosChanged.connect(self._on_combos_changed)
 
         if self.store:
             self.store.on_changed(self._on_store_changed)
@@ -151,15 +169,39 @@ class ComparePage(QWidget):
                 self.payment_preview.set_pixmap(pixmap)
         self._update_link_buttons()
 
+    # ── 关联文件定位 ──────────────────────────────────────
+
+    def _on_locate_all_from_invoice(self, _source_file_id: str,
+                                    payment_ids: list):
+        """发票侧定位所有：支付侧仅显示关联支付记录。"""
+        self.payment_panel.set_located_files(payment_ids)
+
+    def _on_locate_all_from_payment(self, _source_file_id: str,
+                                    invoice_ids: list):
+        """支付侧定位所有：发票侧仅显示关联发票。"""
+        self.invoice_panel.set_located_files(invoice_ids)
+
+    def _on_locate_file_from_invoice(self, payment_id: str):
+        """发票子行定位文件：支付侧选中并滚动到目标记录。"""
+        self.payment_panel.locate_file(payment_id)
+
+    def _on_locate_file_from_payment(self, invoice_id: str):
+        """支付子行定位文件：发票侧选中并滚动到目标发票。"""
+        self.invoice_panel.locate_file(invoice_id)
+
     def _update_link_buttons(self):
-        """更新关联按钮状态。"""
+        """更新关联按钮状态（支持 组合↔文件 / 组合↔组合）。"""
         inv = self.invoice_panel.get_selected_file()
         pay = self.payment_panel.get_selected_file()
-        both_selected = inv is not None and pay is not None
+        inv_combo = self.invoice_panel.get_selected_combo()
+        pay_combo = self.payment_panel.get_selected_combo()
 
+        both_selected = (inv or inv_combo) is not None and (pay or pay_combo) is not None
         self.btn_link.setEnabled(both_selected)
 
-        if both_selected and self.store:
+        # 取消关联/重命名仅对「单文件↔单文件」生效
+        single_pair = inv is not None and pay is not None
+        if single_pair and self.store:
             linked = self.store.is_linked(inv.file_id, pay.file_id)
             self.btn_unlink.setEnabled(linked)
             self.btn_rename.setEnabled(linked)
@@ -167,14 +209,12 @@ class ComparePage(QWidget):
             self.btn_unlink.setEnabled(False)
             self.btn_rename.setEnabled(False)
 
-    # ── 审阅开关回调 ─────────────────────────────────────
-
     def _on_review_toggled(self, checked: bool):
         """审阅模式开关切换。"""
         self._review_mode = checked
         if checked:
             self.btn_auto_match.setText("自动比对")
-            self.btn_auto_match.setToolTip("逐对审阅确认关联：自动识别金额匹配项，人工逐一确认")
+            self.btn_auto_match.setToolTip("弹出关联组审阅界面：自动识别金额匹配项，人工调整后批量确认")
         else:
             self.btn_auto_match.setText("一键自动关联")
             self.btn_auto_match.setToolTip("自动关联所有金额相同的发票与支付记录")
@@ -196,94 +236,72 @@ class ComparePage(QWidget):
             return
 
         if self._review_mode:
-            self._start_review_mode()
+            self._open_auto_match_dialog()
         else:
             self._start_auto_link_mode()
 
-    def _start_review_mode(self):
-        """审阅模式：逐对展示，人工确认每对关联。"""
-        self._current_match_idx = 0
-        self._show_current_match()
-
-    def _show_current_match(self):
-        """展示当前匹配对（选中文件 + 更新预览 + 更新进度标签）。"""
-        if self._current_match_idx < 0 or self._current_match_idx >= len(self._match_pairs):
-            self._finish_review()
+    def _open_auto_match_dialog(self):
+        """审阅模式：弹出模态二级界面，确认后批量自动关联。"""
+        dialog = AutoMatchDialog(self._match_pairs, store=self.store, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._match_pairs = []
+            self.lbl_match_progress.setText("")
             return
 
-        pair = self._match_pairs[self._current_match_idx]
-        total = len(self._match_pairs)
-
-        # 更新进度标签
-        self.lbl_match_progress.setText(
-            f"审阅中：{self._current_match_idx + 1} / {total}"
-        )
-
-        # 选中对应的发票和支付记录
-        self.invoice_panel.select_by_id(pair["invoice_id"])
-        self.payment_panel.select_by_id(pair["payment_id"])
-
-        # 更新按钮文本，提示当前操作
-        self.btn_link.setText(
-            f"关联选中项（{self._current_match_idx + 1}/{total}）"
-        )
-        self.btn_link.setEnabled(True)
-
-    def _on_link(self):
-        """关联选中项（重写，支持审阅模式自动推进）。"""
-        inv = self.invoice_panel.get_selected_file()
-        pay = self.payment_panel.get_selected_file()
-        if not inv or not pay:
-            return
-
-        if self.store.is_linked(inv.file_id, pay.file_id):
-            MkMessage.warning(self, "这两个文件已经关联过了")
-            # 审阅模式下跳过已关联的，继续下一个
-            if self._match_pairs and self._current_match_idx >= 0:
-                self._advance_to_next_match()
-            return
-
-        if self.store.add_association(inv.file_id, pay.file_id):
-            pair_amount = ""
-            if self._match_pairs and self._current_match_idx >= 0:
-                pair_amount = (
-                    f"（金额 ¥{self._match_pairs[self._current_match_idx].get('amount', '—')}）"
-                )
-            MkMessage.success(self, f"已关联：{inv.file_name} ↔ {pay.file_name} {pair_amount}")
-            self._update_link_buttons()
-
-            # 审阅模式下自动推进到下一对
-            if self._match_pairs and self._current_match_idx >= 0:
-                self._advance_to_next_match()
-        else:
-            MkMessage.error(self, "关联失败，请重试")
-
-    def _advance_to_next_match(self):
-        """推进到下一对匹配。"""
-        self._current_match_idx += 1
-        if self._current_match_idx >= len(self._match_pairs):
-            self._finish_review()
-        else:
-            self._show_current_match()
-
-    def _finish_review(self):
-        """审阅完成：恢复 UI 状态。"""
-        remaining = self.store.get_amount_matches() if self.store else []
-        self.lbl_match_progress.setText(
-            f"审阅完成！剩余 {len(remaining)} 对未关联"
-            if remaining
-            else "审阅完成！所有匹配项已关联 ✓"
-        )
+        pairs = dialog.accepted_pairs()
+        total = len(pairs)
+        count = self.store.batch_link(pairs, auto_linked=True)
+        self._match_pairs = []
         self.btn_link.setText("关联选中项")
         self.btn_link.setEnabled(False)
-        self._match_pairs = []
-        self._current_match_idx = -1
-        self._update_link_buttons()
-        MkMessage.success(
-            self,
-            "自动比对审阅完成！\n"
-            + (f"还有 {len(remaining)} 对未处理。" if remaining else "所有匹配项已全部关联。"),
+        self.lbl_match_progress.setText(
+            f"自动比对已保存：{count} / {total} 对"
         )
+
+        if count > 0:
+            MkMessage.success(
+                self,
+                f"自动比对已保存，成功关联 {count} / {total} 对。",
+            )
+        else:
+            MkMessage.warning(self, "没有新增关联，可能这些配对已被关联。")
+
+        self._update_link_buttons()
+
+    def _on_link(self):
+        """手动关联选中的发票与支付记录（支持组合↔文件 / 组合↔组合批量关联）。"""
+        inv_combo = self.invoice_panel.get_selected_combo()
+        pay_combo = self.payment_panel.get_selected_combo()
+        inv = self.invoice_panel.get_selected_file()
+        pay = self.payment_panel.get_selected_file()
+
+        inv_ids = list(inv_combo["file_ids"]) if inv_combo else (
+            [inv.file_id] if inv else []
+        )
+        pay_ids = list(pay_combo["file_ids"]) if pay_combo else (
+            [pay.file_id] if pay else []
+        )
+        if not inv_ids or not pay_ids:
+            return
+
+        total = len(inv_ids) * len(pay_ids)
+        count = self.store.batch_link(
+            [{"invoice_ids": inv_ids, "payment_ids": pay_ids}],
+            auto_linked=False,
+        )
+        if count > 0:
+            if not inv_combo and not pay_combo:
+                MkMessage.success(self, f"已关联：{inv.file_name} ↔ {pay.file_name}")
+            else:
+                label = "组合" if (inv_combo or pay_combo) else "文件"
+                MkMessage.success(
+                    self, f"已关联：{label} ↔ {label}，成功 {count} / {total} 对",
+                )
+        else:
+            MkMessage.warning(
+                self, "没有新增关联，可能这些文件已经关联过了。",
+            )
+        self._update_link_buttons()
 
     def _start_auto_link_mode(self):
         """一键自动关联模式：批量关联所有金额匹配对，并添加标记。"""
@@ -308,7 +326,6 @@ class ComparePage(QWidget):
             MkMessage.warning(self, "未能关联任何配对，可能已被关联。")
 
         self._match_pairs = []
-        self._current_match_idx = -1
         self._update_link_buttons()
 
     # ── 关联操作（手动）────────────────────────────────────
@@ -371,6 +388,12 @@ class ComparePage(QWidget):
             MkMessage.error(
                 self, "重命名失败，可能目标文件已存在或文件被占用。"
             )
+
+    def _on_combos_changed(self):
+        """组合增删后：两侧面板重建树（保持层级与金额最新）。"""
+        self.invoice_panel.reload_from_store()
+        self.payment_panel.reload_from_store()
+        self._update_link_buttons()
 
     def _on_store_changed(self):
         """Store 数据变更时刷新两个列表面板的状态徽标。"""

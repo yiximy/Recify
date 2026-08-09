@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import uuid
 from typing import Optional
 
 from .models import (
@@ -45,6 +46,7 @@ class Store:
             data.setdefault("associations", [])
             data.setdefault("invoice_folder", "")
             data.setdefault("payment_folder", "")
+            data.setdefault("combos", [])
             return data
         except (json.JSONDecodeError, IOError):
             return self._empty_data()
@@ -58,6 +60,7 @@ class Store:
             "invoices": {},
             "payments": {},
             "associations": [],
+            "combos": [],
         }
 
     def _save(self):
@@ -346,71 +349,229 @@ class Store:
                         result.append((fid, pay_dict.get("file_name", ""), val))
             return result
 
-    # ── 自动比对 ────────────────────────────────────────────
 
-    def get_amount_matches(self) -> list[dict]:
-        """查找金额相同的未关联发票-支付记录配对。
+    # ── 组合（Combo）管理 ──────────────────────────────────
 
-        基于 final_amount 匹配（优先 edited > recognized）。
-        仅匹配双方均已有金额且尚未互相关联的记录。
+    def create_combo(self, kind: str, name: str, file_ids: list[str]) -> str:
+        """创建组合：kind 为 'invoice' | 'payment'。
 
+        成员 file_ids 有序、去重，仅保留当前存在且未缺失的文件。
         Returns:
-            [{"invoice_id": str, "payment_id": str, "invoice_name": str,
-              "payment_name": str, "amount": float}, ...]
+            新组合的 combo_id
         """
         with self._lock:
-            # 直接从原始数据构建，避免内部递归加锁
-            inv_dicts = [
-                (fid, d) for fid, d in self._data["invoices"].items()
-                if not d.get("missing")
-            ]
-            pay_dicts = [
-                (fid, d) for fid, d in self._data["payments"].items()
-                if not d.get("missing")
+            data_key = "invoices" if kind == "invoice" else "payments"
+            valid: list[str] = []
+            seen: set[str] = set()
+            for fid in file_ids:
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                entry = self._data[data_key].get(fid)
+                if entry and not entry.get("missing"):
+                    valid.append(fid)
+            combo_id = "cb_" + uuid.uuid4().hex[:16]
+            self._data.setdefault("combos", []).append({
+                "combo_id": combo_id,
+                "kind": kind,
+                "name": (name or "未命名组合").strip(),
+                "file_ids": valid,
+                "created_at": now_iso(),
+            })
+            self._save()
+            self._notify()
+            return combo_id
+
+    def delete_combo(self, combo_id: str) -> bool:
+        """删除组合，返回是否删除成功。"""
+        with self._lock:
+            combos = self._data.get("combos", [])
+            for i, c in enumerate(combos):
+                if c["combo_id"] == combo_id:
+                    combos.pop(i)
+                    self._save()
+                    self._notify()
+                    return True
+            return False
+
+    def get_combos(self, kind: str) -> list[dict]:
+        """获取指定类型的组合列表（副本，避免外部误改）。"""
+        with self._lock:
+            return [
+                dict(c) for c in self._data.get("combos", [])
+                if c.get("kind") == kind
             ]
 
-            # 构建已关联集合
+    def get_combo(self, combo_id: str) -> Optional[dict]:
+        """按 combo_id 获取组合（副本）。"""
+        with self._lock:
+            for c in self._data.get("combos", []):
+                if c["combo_id"] == combo_id:
+                    return dict(c)
+            return None
+
+    def add_combo_files(self, combo_id: str, file_ids: list[str]):
+        """向组合追加成员（去重，仅保留存在且未缺失的文件）。"""
+        with self._lock:
+            combo = next(
+                (c for c in self._data.get("combos", [])
+                 if c["combo_id"] == combo_id),
+                None,
+            )
+            if not combo:
+                return
+            data_key = "invoices" if combo["kind"] == "invoice" else "payments"
+            for fid in file_ids:
+                if fid in combo["file_ids"]:
+                    continue
+                entry = self._data[data_key].get(fid)
+                if entry and not entry.get("missing"):
+                    combo["file_ids"].append(fid)
+            self._save()
+            self._notify()
+
+    def remove_combo_file(self, combo_id: str, file_id: str):
+        """从组合移除成员文件（组合可留空）。"""
+        with self._lock:
+            combo = next(
+                (c for c in self._data.get("combos", [])
+                 if c["combo_id"] == combo_id),
+                None,
+            )
+            if not combo:
+                return
+            if file_id in combo["file_ids"]:
+                combo["file_ids"].remove(file_id)
+                self._save()
+                self._notify()
+
+    def get_combo_total(self, combo_id: str) -> float:
+        """组合成员 final_amount 求和（round 2），跳过 missing/无金额成员。"""
+        with self._lock:
+            combo = next(
+                (c for c in self._data.get("combos", [])
+                 if c["combo_id"] == combo_id),
+                None,
+            )
+            if not combo:
+                return 0.0
+            data_key = "invoices" if combo["kind"] == "invoice" else "payments"
+            total = 0.0
+            for fid in combo.get("file_ids", []):
+                entry = self._data[data_key].get(fid)
+                if not entry or entry.get("missing"):
+                    continue
+                rec = AmountRecord.from_dict(entry.get("amount"))
+                amt = rec.final_amount
+                if amt is None:
+                    continue
+                total += amt
+            return round(total, 2)
+
+    # ── 自动比对 ────────────────────────────────────────────
+
+
+    def get_amount_matches(self) -> list[dict]:
+        """查找金额相同的未关联「文件组」配对。
+
+        匹配单元为单文件或组合（成员 final_amount 求和）：
+        - 单文件金额 ↔ 单文件金额
+        - 组合总额 ↔ 单文件金额 / 单文件金额 ↔ 组合总额 / 组合总额 ↔ 组合总额
+        任一成员已关联的候选跳过；missing 文件与无金额单元跳过。
+
+        Returns:
+            [{"invoice_ids": [str], "payment_ids": [str], "invoice_name": str,
+              "payment_name": str, "amount": float,
+              "is_combo_invoice": bool, "is_combo_payment": bool}, ...]
+        """
+        with self._lock:
+            inv_units = self._build_match_units("invoices")
+            pay_units = self._build_match_units("payments")
+
+            # 已关联集合：任一成员已关联即跳过候选
             linked_pairs = {
                 (a["invoice_id"], a["payment_id"])
                 for a in self._data["associations"]
             }
 
             matches = []
-            for inv_id, inv_d in inv_dicts:
-                inv_amount = inv_d.get("amount", {})
-                inv_rec = AmountRecord.from_dict(inv_amount)
-                inv_amt = inv_rec.final_amount
-                if inv_amt is None:
-                    continue
-
-                for pay_id, pay_d in pay_dicts:
-                    pay_amount = pay_d.get("amount", {})
-                    pay_rec = AmountRecord.from_dict(pay_amount)
-                    pay_amt = pay_rec.final_amount
-                    if pay_amt is None:
+            for iu in inv_units:
+                for pu in pay_units:
+                    if abs(iu["amount"] - pu["amount"]) > 0.01:
                         continue
-
-                    if abs(inv_amt - pay_amt) > 0.01:
+                    if any(
+                        (iid, pid) in linked_pairs
+                        for iid in iu["ids"] for pid in pu["ids"]
+                    ):
                         continue
-
-                    if (inv_id, pay_id) in linked_pairs:
-                        continue
-
                     matches.append({
-                        "invoice_id": inv_id,
-                        "payment_id": pay_id,
-                        "invoice_name": inv_d["file_name"],
-                        "payment_name": pay_d["file_name"],
-                        "amount": round(inv_amt, 2),
+                        "invoice_ids": list(iu["ids"]),
+                        "payment_ids": list(pu["ids"]),
+                        "invoice_name": iu["name"],
+                        "payment_name": pu["name"],
+                        "amount": round(iu["amount"], 2),
+                        "is_combo_invoice": iu["is_combo"],
+                        "is_combo_payment": pu["is_combo"],
                     })
-
             return matches
 
+    def _build_match_units(self, data_key: str) -> list[dict]:
+        """构建金额匹配单元列表：单文件（非组合成员）与组合。"""
+        kind = "invoice" if data_key == "invoices" else "payment"
+        member_ids: set[str] = set()
+        combos = self._data.get("combos", [])
+        for c in combos:
+            if c.get("kind") == kind:
+                member_ids.update(c.get("file_ids", []))
+
+        units: list[dict] = []
+        # 单文件单元（不在任何组合中）
+        for fid, d in self._data[data_key].items():
+            if d.get("missing") or fid in member_ids:
+                continue
+            rec = AmountRecord.from_dict(d.get("amount"))
+            amt = rec.final_amount
+            if amt is None:
+                continue
+            units.append({
+                "ids": [fid],
+                "name": d.get("file_name", ""),
+                "amount": amt,
+                "is_combo": False,
+            })
+        # 组合单元（成员金额求和，至少一个成员有金额才纳入）
+        for c in combos:
+            if c.get("kind") != kind:
+                continue
+            total = 0.0
+            has_amount = False
+            for fid in c.get("file_ids", []):
+                entry = self._data[data_key].get(fid)
+                if not entry or entry.get("missing"):
+                    continue
+                rec = AmountRecord.from_dict(entry.get("amount"))
+                amt = rec.final_amount
+                if amt is None:
+                    continue
+                total += amt
+                has_amount = True
+            if not has_amount:
+                continue
+            units.append({
+                "ids": list(c["file_ids"]),
+                "name": c.get("name", ""),
+                "amount": round(total, 2),
+                "is_combo": True,
+            })
+        return units
+
+
     def batch_link(self, pairs: list[dict], auto_linked: bool = True) -> int:
-        """批量关联发票与支付记录。
+        """批量关联发票与支付记录（支持组合↔组合的成员两两组合）。
 
         Args:
-            pairs: [{"invoice_id": str, "payment_id": str}, ...]
+            pairs: [{"invoice_ids": [str], "payment_ids": [str]}, ...]
+                   兼容旧结构 {"invoice_id": str, "payment_id": str}
             auto_linked: 是否标记为自动关联
 
         Returns:
@@ -419,28 +580,36 @@ class Store:
         count = 0
         with self._lock:
             for pair in pairs:
-                inv_id = pair["invoice_id"]
-                pay_id = pair["payment_id"]
-                inv = self._data["invoices"].get(inv_id)
-                pay = self._data["payments"].get(pay_id)
-                if not inv or not pay:
-                    continue
-                # 避免重复：检查双向关联列表 + 关联表
-                exists = (
-                    pay_id in inv.setdefault("linked_payment_ids", [])
-                    or any(
-                        a["invoice_id"] == inv_id and a["payment_id"] == pay_id
-                        for a in self._data["associations"]
-                    )
+                inv_ids = pair.get("invoice_ids") or (
+                    [pair["invoice_id"]] if pair.get("invoice_id") else []
                 )
-                if exists:
-                    continue
-                inv["linked_payment_ids"].append(pay_id)
-                pay.setdefault("linked_invoice_ids", []).append(inv_id)
-                self._data["associations"].append(
-                    Association(inv_id, pay_id, now_iso(), auto_linked=auto_linked).to_dict()
+                pay_ids = pair.get("payment_ids") or (
+                    [pair["payment_id"]] if pair.get("payment_id") else []
                 )
-                count += 1
+                for inv_id in inv_ids:
+                    for pay_id in pay_ids:
+                        inv = self._data["invoices"].get(inv_id)
+                        pay = self._data["payments"].get(pay_id)
+                        if not inv or not pay:
+                            continue
+                        # 避免重复：检查双向关联列表 + 关联表
+                        exists = (
+                            pay_id in inv.setdefault("linked_payment_ids", [])
+                            or any(
+                                a["invoice_id"] == inv_id and a["payment_id"] == pay_id
+                                for a in self._data["associations"]
+                            )
+                        )
+                        if exists:
+                            continue
+                        inv["linked_payment_ids"].append(pay_id)
+                        pay.setdefault("linked_invoice_ids", []).append(inv_id)
+                        self._data["associations"].append(
+                            Association(
+                                inv_id, pay_id, now_iso(), auto_linked=auto_linked
+                            ).to_dict()
+                        )
+                        count += 1
             if count > 0:
                 self._save()
                 self._notify()
