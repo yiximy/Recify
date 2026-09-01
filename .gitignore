@@ -17,10 +17,15 @@ venv/
 *.swp
 
 # 项目数据（用户运行时生成）
-data/store.json
-config/app_config.json
+data/
+config/
 cache/
 logs/
+resource/
+
+# 编辑器临时文件
+_system~.ini
+*.tmp
 
 # 操作系统
 Thumbs.db

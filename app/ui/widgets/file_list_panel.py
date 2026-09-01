@@ -46,15 +46,19 @@ ROLE_PARTNER_NAME = Qt.ItemDataRole.UserRole + 1   # 子行的纯文件名（不
 ROLE_PARTNER_ID = Qt.ItemDataRole.UserRole + 2     # 子行对应的关联对象 file_id
 ROLE_COMBO_ID = Qt.ItemDataRole.UserRole + 3       # 组合父行存 combo_id；成员文件存所属 combo_id
 
-# 层级配色：父行白底、子行明显区分。为确保在真实主题/高 DPI 下都清晰可辨，
-# 子行除了更明显的浅蓝底，还叠加一条左侧主色强调条（drawRow 中最后绘制，
-# 不受主题重绘影响）。子行文字 #334155 于底色 #dce8fb 对比度 ≈ 9:1，满足
-# WCAG AA/AAA。
-_C_CHILD_BG = QColor("#dce8fb")
+# 层级配色（四层对比，肉眼可辨）：
+#   独立文件行     白底 #ffffff
+#   组合父行       浅蓝底 #cfe4ff + 加粗 #409eff 文字 + 主色强调条
+#   组合成员文件行 浅灰底 #dde3ea
+#   关联对象子行   浅红底 #ffdddd + #334155 文字 + 主色强调条
+# 强调条在 drawRow 中最后绘制（最上层，不受主题重绘影响），保证层级一眼可辨。
+_C_COMBO_BG = QColor("#cfe4ff")           # 组合父行底色（浅蓝，比 #ecf5ff 加深）
+_C_COMBO_FG = QColor("#409eff")           # 组合父行标题色
+_C_CHILD_BG = QColor("#ffdddd")           # 关联子行底色（浅红，红色系验证并保留）
 _C_CHILD_FG = QColor("#334155")
 _C_CHILD_ACCENT = QColor("#409eff")
-_C_MEMBER_BG = QColor("#f0f4fa")          # 组合成员文件行底色（区分层级）
-_CHILD_ACCENT_WIDTH = 3
+_C_MEMBER_BG = QColor("#dde3ea")          # 组合成员文件行底色（浅灰，比 #f5f7fa 加深）
+_ACCENT_WIDTH = 5                          # 强调条宽度（组合父行/关联子行）
 
 # 树控件样式（镜像 MkTable 的 Elegant Light 观感，保证视觉统一）
 _TREE_QSS = """
@@ -149,6 +153,7 @@ class _HierarchyTree(QTreeWidget):
         item = self.itemFromIndex(index)
         is_partner = False
         is_member = False
+        is_combo_root = False
         if item is not None:
             is_partner = item.data(COL_SEQ, ROLE_PARTNER_ID) is not None
             is_member = (
@@ -156,14 +161,21 @@ class _HierarchyTree(QTreeWidget):
                 and item.parent() is not None
                 and item.data(COL_SEQ, ROLE_COMBO_ID) is not None
             )
+            is_combo_root = (
+                not is_partner
+                and item.parent() is None
+                and item.data(COL_SEQ, ROLE_COMBO_ID) is not None
+            )
         if is_partner:
             painter.fillRect(option.rect, _C_CHILD_BG)
         elif is_member:
             painter.fillRect(option.rect, _C_MEMBER_BG)
+        elif is_combo_root:
+            painter.fillRect(option.rect, _C_COMBO_BG)
         super().drawRow(painter, option, index)
-        if is_partner:
+        if is_partner or is_combo_root:
             bar = QRect(option.rect.left(), option.rect.top(),
-                        _CHILD_ACCENT_WIDTH, option.rect.height())
+                        _ACCENT_WIDTH, option.rect.height())
             painter.fillRect(bar, _C_CHILD_ACCENT)
 
 def _format_date(iso_str: str) -> str:
@@ -432,7 +444,7 @@ class FileListPanel(QWidget):
         bold = QFont()
         bold.setBold(True)
         item.setFont(COL_NAME, bold)
-        item.setForeground(COL_NAME, QBrush(QColor("#409eff")))
+        item.setForeground(COL_NAME, QBrush(_C_COMBO_FG))
         for mf in members:
             child = self._make_member_item(mf, combo["combo_id"])
             item.addChild(child)
@@ -674,6 +686,30 @@ class FileListPanel(QWidget):
         self._current_file_id = file_id
         self.fileSelected.emit(file_id)
 
+    def _collect_unlink_files(self, top_files, top_combos) -> list:
+        """把选中的顶层项展开为待取消关联的文件对象列表。
+
+        顶层独立文件直接纳入；组合父行展开为其全部成员文件；按 file_id 去重。
+        """
+        files: list = []
+        seen: set[str] = set()
+        for i in top_files:
+            f = self._file_by_id(i.data(COL_SEQ, ROLE_FILE_ID))
+            if f is not None and f.file_id not in seen:
+                files.append(f)
+                seen.add(f.file_id)
+        if self.store:
+            for i in top_combos:
+                combo = self.store.get_combo(i.data(COL_SEQ, ROLE_COMBO_ID))
+                if not combo:
+                    continue
+                for fid in combo.get("file_ids", []):
+                    f = self._file_by_id(fid)
+                    if f is not None and f.file_id not in seen:
+                        files.append(f)
+                        seen.add(f.file_id)
+        return files
+
     def _on_tree_context_menu(self, pos):
         """右键菜单：关联子行复制/定位；文件行定位所有/取消所有关联/组合；组合父行取消组合。"""
         item = self.tree.itemAt(pos)
@@ -717,21 +753,46 @@ class FileListPanel(QWidget):
             i for i in selected
             if i.parent() is None and i.data(COL_SEQ, ROLE_FILE_ID)
         ]
+        top_combos = [
+            i for i in selected
+            if i.parent() is None and i.data(COL_SEQ, ROLE_COMBO_ID)
+        ]
+        # 多选判定：选中的顶层项 = 顶层独立文件 + 组合父行（按 ROLE_COMBO_ID 识别），
+        # 组合父行也计入，避免含组合父行时误走单文件分支
+        all_selected_top = (
+            len(selected) > 0
+            and len(top_files) + len(top_combos) == len(selected)
+        )
         multi = (
+            is_top_level
+            and all_selected_top
+            and len(top_files) + len(top_combos) >= 2
+        )
+        # 「组合」仍仅对顶层独立文件多选生效（组合父行不参与创建组合）
+        multi_files = (
             is_top_level
             and len(top_files) >= 2
             and len(top_files) == len(selected)
         )
 
+        # 「取消所有关联」作用对象：多选时为全部选中顶层独立文件 + 组合父行的成员文件；
+        # 否则为右键文件
+        if multi:
+            unlink_files = self._collect_unlink_files(top_files, top_combos)
+        else:
+            unlink_files = [file_obj]
+        has_partner = any(self._partner_entries(f) for f in unlink_files)
+
         partner_ids = [pid for _, pid in self._partner_entries(file_obj)]
 
         menu = QMenu(self.tree)
         menu.setStyleSheet(_MENU_QSS)
-        act_combo = menu.addAction("组合") if multi else None
+        act_combo = menu.addAction("组合") if multi_files else None
         act_locate_all = None
         act_unlink_all = None
         if partner_ids:
             act_locate_all = menu.addAction("定位所有")
+        if has_partner:
             act_unlink_all = menu.addAction("取消所有关联")
         if not menu.actions():
             return
@@ -743,7 +804,10 @@ class FileListPanel(QWidget):
         elif selected_action is act_locate_all:
             self.locateAllRequested.emit(fid, partner_ids)
         elif selected_action is act_unlink_all:
-            self._on_unlink_all(file_obj, partner_ids)
+            if multi:
+                self._on_unlink_all_files(unlink_files)
+            else:
+                self._on_unlink_all(file_obj, partner_ids)
 
     # ── 组合/取消关联 操作 ────────────────────────────────
 
@@ -811,6 +875,30 @@ class FileListPanel(QWidget):
                 self.store.remove_association(pid, file_obj.file_id)
         MkMessage.success(self, f"已取消「{file_obj.file_name}」的全部关联")
 
+    def _on_unlink_all_files(self, files):
+        """多选文件：确认后逐个取消全部关联，完成后提示取消条数。"""
+        if not self.store or not files:
+            return
+        ret = QMessageBox.question(
+            self, "取消所有关联",
+            f"确定要取消 {len(files)} 个文件的全部关联吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        removed = 0
+        for f in files:
+            for _, pid in self._partner_entries(f):
+                if self.kind == "invoice":
+                    ok = self.store.remove_association(f.file_id, pid)
+                else:
+                    ok = self.store.remove_association(pid, f.file_id)
+                if ok:
+                    removed += 1
+        MkMessage.success(
+            self, f"已取消 {len(files)} 个文件的全部关联，共 {removed} 条",
+        )
+
     def _on_unlink_all_combo(self, combo: dict):
         """取消组合内全部成员的所有关联（带确认）。"""
         partner_ids = self._combo_partner_ids(combo)
@@ -827,7 +915,7 @@ class FileListPanel(QWidget):
             f = self._file_by_id(fid)
             if f is None:
                 continue
-            for pid, _ in self._partner_entries(f):
+            for _, pid in self._partner_entries(f):
                 if self.kind == "invoice":
                     self.store.remove_association(fid, pid)
                 else:

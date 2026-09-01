@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor, QFont
+from PySide6.QtCore import QRect, Qt, QTimer
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -29,8 +29,29 @@ from PySide6.QtWidgets import (
 from monkeyqt import MkButton, MkMessage
 
 # QTreeWidgetItem 自定义数据角色
-ROLE_FILE_ID = Qt.ItemDataRole.UserRole       # 组内文件行：文件 file_id
-ROLE_GROUP_NAME = Qt.ItemDataRole.UserRole + 1  # 组标题基名（如「关联组1」）
+ROLE_FILE_ID = Qt.ItemDataRole.UserRole         # 组内文件行：文件 file_id
+ROLE_GROUP_NAME = Qt.ItemDataRole.UserRole + 1    # 组标题（含序号徽章，如「① 关联组1」）
+ROLE_GROUP_COLOR = Qt.ItemDataRole.UserRole + 2   # 组合父行：同色分组背景色
+ROLE_GROUP_ACCENT = Qt.ItemDataRole.UserRole + 3  # 组合父行：同色分组强调色
+
+# 同色分组调色板（Elegant Light 语义色）：背景 / 强调色，按组索引循环。
+# 左右两树同索引组使用同一组颜色，配合同步滚动形成明确的「左右对齐连接」。
+_GROUP_PALETTE_BG = [
+    QColor("#ecf5ff"),  # 蓝
+    QColor("#f0f9eb"),  # 绿
+    QColor("#fdf6ec"),  # 橙
+    QColor("#fef0f0"),  # 红
+    QColor("#f4f4f5"),  # 灰
+]
+_GROUP_PALETTE_ACCENT = [
+    QColor("#409eff"),
+    QColor("#67c23a"),
+    QColor("#e6a23c"),
+    QColor("#f56c6c"),
+    QColor("#909399"),
+]
+_GROUP_ACCENT_WIDTH = 4          # 组合父行左侧强调条宽度
+_GROUP_BADGES = "①②③④⑤⑥⑦⑧⑨⑩"  # 序号徽章（1~10）
 
 _TREE_QSS = """
 QTreeWidget {
@@ -131,8 +152,12 @@ class _GroupTree(QTreeWidget):
     """关联组树：顶层=「关联组N」（默认展开、不可拖动、可接收 drop），子项=组内文件。
 
     文件子项可拖拽到同侧其他组（换组）；拖放后通过 on_groups_changed 回调
-    刷新组标题（空组标记「（空）」）。
+    刷新组标题（空组标记「（空）」）。拖拽时靠近顶部/底部边缘自动滚动；
+    拖放后归一化结构，保证始终为「组合父行 → 组内文件」两层。
     """
+
+    _SCROLL_MARGIN = 28       # 触发自动滚动的边缘像素距离
+    _SCROLL_INTERVAL = 60     # 自动滚动定时器间隔（毫秒）
 
     def __init__(self, on_groups_changed=None, parent=None):
         super().__init__(parent)
@@ -150,11 +175,107 @@ class _GroupTree(QTreeWidget):
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setStyleSheet(_TREE_QSS)
+        # 拖拽自动滚动：进入拖拽时启动，离开/落点停止
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setInterval(self._SCROLL_INTERVAL)
+        self._scroll_timer.timeout.connect(self._auto_scroll_step)
+
+    def drawRow(self, painter, option, index):
+        """组合父行整行填充同色分组背景 + 左侧同色强调条（左右两树同索引同色）。"""
+        item = self.itemFromIndex(index)
+        if item is not None and item.parent() is None:
+            color = item.data(0, ROLE_GROUP_COLOR)
+            accent = item.data(0, ROLE_GROUP_ACCENT)
+            if color is not None:
+                painter.fillRect(option.rect, color)
+            super().drawRow(painter, option, index)
+            if accent is not None:
+                bar = QRect(option.rect.left(), option.rect.top(),
+                            _GROUP_ACCENT_WIDTH, option.rect.height())
+                painter.fillRect(bar, accent)
+            return
+        super().drawRow(painter, option, index)
+
+    def dragEnterEvent(self, event):
+        super().dragEnterEvent(event)
+        if event.isAccepted():
+            self._scroll_timer.start()
+
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)
+        if not event.isAccepted():
+            return
+        indicator = self.dropIndicatorPosition()
+        target = self.itemAt(event.position().toPoint())
+        if indicator == QAbstractItemView.DropIndicatorPosition.OnViewport:
+            # 空白区不放行：避免产生顶层文件行，破坏「组 → 文件」两层结构
+            event.ignore()
+        elif indicator == QAbstractItemView.DropIndicatorPosition.OnItem:
+            # 仅允许落入组合父行；落点是文件行会形成嵌套，拒绝
+            if target is None or target.parent() is not None:
+                event.ignore()
+        else:
+            # Above/Below：仅允许组内文件之间的重排；落在组合父行会变成顶层文件行
+            if target is None or target.parent() is None:
+                event.ignore()
+        if event.isAccepted():
+            self._auto_scroll_step()
+
+    def dragLeaveEvent(self, event):
+        self._scroll_timer.stop()
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        self._scroll_timer.stop()
         super().dropEvent(event)
+        self._normalize_tree()
         if self.on_groups_changed:
             self.on_groups_changed()
+
+    # ── 拖拽自动滚动 ────────────────────────────────────
+
+    def _auto_scroll_step(self):
+        """按鼠标距顶部/底部边缘的距离成比例滚动（越靠近边缘越快）。"""
+        if not self.viewport().underMouse():
+            return
+        pos = self.viewport().mapFromGlobal(QCursor.pos())
+        rect = self.viewport().rect()
+        if not rect.contains(pos):
+            return
+        margin = self._SCROLL_MARGIN
+        speed = 0
+        if pos.y() < rect.top() + margin:
+            speed = -((margin - (pos.y() - rect.top())) // 2) - 1
+        elif pos.y() > rect.bottom() - margin:
+            speed = ((pos.y() - (rect.bottom() - margin)) // 2) + 1
+        if speed:
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() + speed
+            )
+
+    # ── 结构归一化 ──────────────────────────────────────
+
+    def _normalize_tree(self):
+        """保证「组合父行 → 组内文件」两层：所有后代文件上提为组直接子行。"""
+        for i in range(self.topLevelItemCount()):
+            group = self.topLevelItem(i)
+            if group.data(0, ROLE_GROUP_NAME) is None:
+                continue
+            files: list[QTreeWidgetItem] = []
+
+            def collect(item):
+                for j in range(item.childCount()):
+                    child = item.child(j)
+                    if child.data(0, ROLE_FILE_ID):
+                        files.append(child)
+                    collect(child)
+
+            collect(group)
+            group.takeChildren()
+            for child in files:
+                # 拍平自身子节点：确保每个文件行都是叶节点（两层结构）
+                child.takeChildren()
+                group.addChild(child)
 
 
 class AutoMatchDialog(QDialog):
@@ -167,9 +288,6 @@ class AutoMatchDialog(QDialog):
         self._store = store
         self._syncing_scroll = False
         self._rows = self._build_rows(matches)
-        # 候选池：对话框当前涉及的同类型文件（按首次出现去重）
-        self._invoice_pool = self._build_pool("invoice")
-        self._payment_pool = self._build_pool("payment")
 
         self.setWindowTitle("自动比对审阅")
         self.setModal(True)
@@ -200,16 +318,6 @@ class AutoMatchDialog(QDialog):
                 amt = f.amount.final_amount if f.amount else None
                 return f.file_name, amt
         return "未知文件", None
-
-    def _build_pool(self, kind: str) -> list[tuple[str, str, Optional[float]]]:
-        """构建候选池：[(file_id, 文件名, 金额), ...]，按出现顺序去重。"""
-        pool: dict[str, tuple[str, Optional[float]]] = {}
-        for m in self._matches:
-            ids = m.get("invoice_ids", []) if kind == "invoice" else m.get("payment_ids", [])
-            for fid in ids:
-                if fid not in pool:
-                    pool[fid] = self._resolve_file(kind, fid)
-        return [(fid, name, amt) for fid, (name, amt) in pool.items()]
 
     # ── UI 构建 ──────────────────────────────────────────
 
@@ -291,8 +399,13 @@ class AutoMatchDialog(QDialog):
                    kind: str):
         """向指定树添加一个「关联组N」及组内文件。"""
         base_name = f"关联组{idx}"
-        group = QTreeWidgetItem([base_name])
-        group.setData(0, ROLE_GROUP_NAME, base_name)
+        badge = _GROUP_BADGES[idx - 1] if idx <= len(_GROUP_BADGES) else str(idx)
+        display = f"{badge} {base_name}"
+        group = QTreeWidgetItem([display])
+        group.setData(0, ROLE_GROUP_NAME, display)
+        color_idx = (idx - 1) % len(_GROUP_PALETTE_BG)
+        group.setData(0, ROLE_GROUP_COLOR, _GROUP_PALETTE_BG[color_idx])
+        group.setData(0, ROLE_GROUP_ACCENT, _GROUP_PALETTE_ACCENT[color_idx])
         group.setFlags(
             Qt.ItemFlag.ItemIsEnabled
             | Qt.ItemFlag.ItemIsSelectable
@@ -301,7 +414,7 @@ class AutoMatchDialog(QDialog):
         bold = QFont()
         bold.setBold(True)
         group.setFont(0, bold)
-        group.setForeground(0, QBrush(QColor("#409eff")))
+        group.setForeground(0, QBrush(_GROUP_PALETTE_ACCENT[color_idx]))
         tree.addTopLevelItem(group)
         for fid in file_ids:
             name, amt = self._resolve_file(kind, fid)
@@ -335,7 +448,16 @@ class AutoMatchDialog(QDialog):
 
     def _on_group_context(self, tree: _GroupTree, kind: str, pos):
         item = tree.itemAt(pos)
-        if item is None or item.parent() is None:
+        if item is None:
+            return
+        if item.parent() is None:
+            # 组合父行（顶层项）：提供「添加关联」（将文件加入该组合）
+            menu = QMenu(tree)
+            menu.setStyleSheet(_MENU_QSS)
+            act_add = menu.addAction("添加关联")
+            selected = menu.exec(tree.viewport().mapToGlobal(pos))
+            if selected is act_add:
+                self._add_file_to_group(tree, kind, item)
             return
         fid = item.data(0, ROLE_FILE_ID)
         if not fid:
@@ -382,13 +504,33 @@ class AutoMatchDialog(QDialog):
 
     def _candidates(self, kind: str,
                     group: QTreeWidgetItem) -> list[tuple[str, str, Optional[float]]]:
-        """同类型候选池减去本组已有成员。"""
-        pool = self._invoice_pool if kind == "invoice" else self._payment_pool
-        existing = {
-            group.child(j).data(0, ROLE_FILE_ID)
-            for j in range(group.childCount())
-        }
-        return [c for c in pool if c[0] not in existing]
+        """候选 = Store 中所有同类型文件（排除缺失、本侧各组合已占用成员）。
+
+        相比旧实现（仅当前匹配列表内文件），改为全量同类型文件，便于把任意
+        同类型文件补进组合；文件添加后成为所属组合的子行。
+        """
+        if not self._store:
+            return []
+        files = (
+            self._store.get_invoices()
+            if kind == "invoice"
+            else self._store.get_payments()
+        )
+        tree = self._left_tree if kind == "invoice" else self._right_tree
+        used: set[str] = set()
+        for i in range(tree.topLevelItemCount()):
+            g = tree.topLevelItem(i)
+            for j in range(g.childCount()):
+                fid = g.child(j).data(0, ROLE_FILE_ID)
+                if fid:
+                    used.add(fid)
+        candidates: list[tuple[str, str, Optional[float]]] = []
+        for f in files:
+            if f.file_id in used:
+                continue
+            amt = f.amount.final_amount if f.amount else None
+            candidates.append((f.file_id, f.file_name, amt))
+        return candidates
 
     # ── 同步滚动 ─────────────────────────────────────────
 
