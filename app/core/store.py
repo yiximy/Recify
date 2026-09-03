@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import uuid
-from typing import Optional
+from typing import Iterable, Optional
 
 from .models import (
     InvoiceFile, PaymentFile, Association, AmountRecord,
@@ -99,15 +99,31 @@ class Store:
 
     # ── 扫描合并 ────────────────────────────────────────────
 
-    def merge_invoices(self, scanned: list[InvoiceFile]):
-        """增量合并发票扫描结果，保留已有关联。"""
+    def merge_invoices(self, scanned: list[InvoiceFile],
+                       mark_missing: bool = True):
+        """增量合并发票扫描结果，保留已有关联。
+
+        Args:
+            mark_missing: True=本次未扫到的同类型文件标 missing（文件夹切换替换语义）；
+                False=纯增量累加（画布多文件夹并集场景，不误伤其他活动文件夹）。
+        """
         with self._lock:
             existing = self._data["invoices"]
             new_ids = {inv.file_id for inv in scanned}
             # 标记缺失文件
-            for fid, inv_dict in existing.items():
-                if fid not in new_ids:
-                    inv_dict["missing"] = True
+            if mark_missing:
+                # True（默认）= 替换语义：本次未扫到的同类型文件全部标 missing
+                for fid, inv_dict in existing.items():
+                    if fid not in new_ids:
+                        inv_dict["missing"] = True
+            else:
+                # False = 增量累加：仅对「本次扫描文件夹内」消失的文件定向标 missing，
+                # 其它活动文件夹不受影响（画布多文件夹场景）
+                scanned_dirs = {self._dir_key(inv.abs_path) for inv in scanned}
+                for fid, inv_dict in existing.items():
+                    if fid not in new_ids and inv_dict.get("abs_path") \
+                            and self._dir_key(inv_dict["abs_path"]) in scanned_dirs:
+                        inv_dict["missing"] = True
             # 合并新扫描结果（保留 linked_payment_ids）
             for inv in scanned:
                 if inv.file_id in existing:
@@ -115,23 +131,41 @@ class Store:
                     inv.linked_payment_ids = old.get("linked_payment_ids", [])
                     inv.amount = AmountRecord.from_dict(old.get("amount"))
                 existing[inv.file_id] = inv.to_dict()
+            # 重扫后清理「成员全部缺失/不存在」的空壳发票组合（保留部分缺失组合）
+            self._prune_shell_combos("invoice")
             self._save()
             self._notify()
 
-    def merge_payments(self, scanned: list[PaymentFile]):
-        """增量合并支付记录扫描结果，保留已有关联和金额。"""
+    def merge_payments(self, scanned: list[PaymentFile],
+                       mark_missing: bool = True):
+        """增量合并支付记录扫描结果，保留已有关联和金额。
+
+        Args:
+            mark_missing: 同 merge_invoices，True=替换语义，False=增量累加。
+        """
         with self._lock:
             existing = self._data["payments"]
             new_ids = {pay.file_id for pay in scanned}
-            for fid, pay_dict in existing.items():
-                if fid not in new_ids:
-                    pay_dict["missing"] = True
+            if mark_missing:
+                # True（默认）= 替换语义
+                for fid, pay_dict in existing.items():
+                    if fid not in new_ids:
+                        pay_dict["missing"] = True
+            else:
+                # False = 增量累加：仅定向清理本次扫描文件夹内消失的文件
+                scanned_dirs = {self._dir_key(pay.abs_path) for pay in scanned}
+                for fid, pay_dict in existing.items():
+                    if fid not in new_ids and pay_dict.get("abs_path") \
+                            and self._dir_key(pay_dict["abs_path"]) in scanned_dirs:
+                        pay_dict["missing"] = True
             for pay in scanned:
                 if pay.file_id in existing:
                     old = existing[pay.file_id]
                     pay.linked_invoice_ids = old.get("linked_invoice_ids", [])
                     pay.amount = AmountRecord.from_dict(old.get("amount"))
                 existing[pay.file_id] = pay.to_dict()
+            # 重扫后清理「成员全部缺失/不存在」的空壳支付组合（保留部分缺失组合）
+            self._prune_shell_combos("payment")
             self._save()
             self._notify()
 
@@ -410,6 +444,57 @@ class Store:
                     return dict(c)
             return None
 
+    def combo_has_active_members(self, combo_id: str) -> bool:
+        """组合是否存在至少 1 个「当前存在且未缺失」的成员。
+
+        空壳组合（成员文件已全部删除/重扫标记缺失）应被 UI 候选过滤并在
+        merge 后清理；部分缺失组合（仍有可用成员）视为有效。
+        """
+        with self._lock:
+            combo = next(
+                (c for c in self._data.get("combos", [])
+                 if c["combo_id"] == combo_id),
+                None,
+            )
+            if not combo:
+                return False
+            data_key = "invoices" if combo["kind"] == "invoice" else "payments"
+            return any(
+                fid in self._data[data_key]
+                and not self._data[data_key][fid].get("missing")
+                for fid in combo.get("file_ids", [])
+            )
+
+    def _prune_shell_combos(self, kind: str) -> int:
+        """移除该 kind 下「成员全部缺失/不存在」的空壳组合，返回删除数量。
+
+        仅在 merge_invoices/merge_payments 重扫后调用（本方法不主动保存，
+        由调用方统一 _save/_notify）：重扫标 missing 后组合内文件已全部消失，
+        保留无意义（引擎本就跳过、UI 也不应暴露），自动清理避免空壳累积。
+        语义取舍：只删「全部成员缺失」的组合；部分缺失组合保留，由 UI 标注。
+        注意：既有 store.json 中的存量空壳组合不在此被动清理范围（不主动改用户数据），
+        仅保证未来重扫不再累积；展示层另有过滤双保险。
+        """
+        data_key = "invoices" if kind == "invoice" else "payments"
+        removed = 0
+        kept: list[dict] = []
+        for c in self._data.get("combos", []):
+            if c.get("kind") != kind:
+                kept.append(c)
+                continue
+            alive = any(
+                fid in self._data[data_key]
+                and not self._data[data_key][fid].get("missing")
+                for fid in c.get("file_ids", [])
+            )
+            if alive:
+                kept.append(c)
+            else:
+                removed += 1
+        if removed:
+            self._data["combos"] = kept
+        return removed
+
     def add_combo_files(self, combo_id: str, file_ids: list[str]):
         """向组合追加成员（去重，仅保留存在且未缺失的文件）。"""
         with self._lock:
@@ -471,7 +556,13 @@ class Store:
     # ── 自动比对 ────────────────────────────────────────────
 
 
-    def get_amount_matches(self) -> list[dict]:
+    def get_amount_matches(
+        self,
+        invoice_folders: Optional[Iterable[str]] = None,
+        payment_folders: Optional[Iterable[str]] = None,
+        tolerance: float = 0.01,
+        include_combos: bool = True,
+    ) -> list[dict]:
         """查找金额相同的未关联「文件组」配对。
 
         匹配单元为单文件或组合（成员 final_amount 求和）：
@@ -479,14 +570,28 @@ class Store:
         - 组合总额 ↔ 单文件金额 / 单文件金额 ↔ 组合总额 / 组合总额 ↔ 组合总额
         任一成员已关联的候选跳过；missing 文件与无金额单元跳过。
 
+        Args:
+            invoice_folders: 可选，发票侧文件夹过滤（目录路径，取并集）。
+                单文件单元要求所在目录在集合内；组合单元要求全部非 missing
+                成员所在目录在集合内（跨界组合整组跳过）。
+            payment_folders: 可选，支付侧文件夹过滤，语义同上。
+            tolerance: 金额误差阈值（元），abs 差 ≤ tolerance 视为相同。
+            include_combos: 是否纳入组合单元（组合成员不单独匹配的语义不变）。
+
         Returns:
             [{"invoice_ids": [str], "payment_ids": [str], "invoice_name": str,
               "payment_name": str, "amount": float,
               "is_combo_invoice": bool, "is_combo_payment": bool}, ...]
         """
         with self._lock:
-            inv_units = self._build_match_units("invoices")
-            pay_units = self._build_match_units("payments")
+            inv_folders = self._norm_folders(invoice_folders)
+            pay_folders = self._norm_folders(payment_folders)
+            inv_units = self._build_match_units(
+                "invoices", folder_set=inv_folders, include_combos=include_combos,
+            )
+            pay_units = self._build_match_units(
+                "payments", folder_set=pay_folders, include_combos=include_combos,
+            )
 
             # 已关联集合：任一成员已关联即跳过候选
             linked_pairs = {
@@ -497,7 +602,7 @@ class Store:
             matches = []
             for iu in inv_units:
                 for pu in pay_units:
-                    if abs(iu["amount"] - pu["amount"]) > 0.01:
+                    if abs(iu["amount"] - pu["amount"]) > tolerance:
                         continue
                     if any(
                         (iid, pid) in linked_pairs
@@ -515,8 +620,29 @@ class Store:
                     })
             return matches
 
-    def _build_match_units(self, data_key: str) -> list[dict]:
-        """构建金额匹配单元列表：单文件（非组合成员）与组合。"""
+    @staticmethod
+    def _norm_folders(folders: Optional[Iterable[str]]) -> Optional[set[str]]:
+        """归一化文件夹集合（normcase + abspath）；None 或空返回 None 表示不过滤。"""
+        if not folders:
+            return None
+        return {os.path.normcase(os.path.abspath(f)) for f in folders}
+
+    @staticmethod
+    def _dir_key(abs_path: str) -> str:
+        """文件所在目录的归一化键（normcase + abspath），用于文件夹范围判定。"""
+        return os.path.normcase(os.path.abspath(os.path.dirname(abs_path)))
+
+    def _build_match_units(self, data_key: str,
+                           folder_set: Optional[set[str]] = None,
+                           include_combos: bool = True) -> list[dict]:
+        """构建金额匹配单元列表：单文件（非组合成员）与组合。
+
+        Args:
+            data_key: "invoices" | "payments"
+            folder_set: 可选目录集合（已归一化）。单文件单元要求所在目录在集合内；
+                组合单元要求全部非 missing 成员所在目录在集合内。
+            include_combos: False 时不产出组合单元（成员保持“不单独匹配”）。
+        """
         kind = "invoice" if data_key == "invoices" else "payment"
         member_ids: set[str] = set()
         combos = self._data.get("combos", [])
@@ -524,10 +650,18 @@ class Store:
             if c.get("kind") == kind:
                 member_ids.update(c.get("file_ids", []))
 
+        def _in_scope(d: dict) -> bool:
+            """单个文件条目是否在文件夹范围内（folder_set 为 None 时全放行）。"""
+            if folder_set is None:
+                return True
+            return self._dir_key(d.get("abs_path", "")) in folder_set
+
         units: list[dict] = []
         # 单文件单元（不在任何组合中）
         for fid, d in self._data[data_key].items():
             if d.get("missing") or fid in member_ids:
+                continue
+            if not _in_scope(d):
                 continue
             rec = AmountRecord.from_dict(d.get("amount"))
             amt = rec.final_amount
@@ -540,29 +674,40 @@ class Store:
                 "is_combo": False,
             })
         # 组合单元（成员金额求和，至少一个成员有金额才纳入）
-        for c in combos:
-            if c.get("kind") != kind:
-                continue
-            total = 0.0
-            has_amount = False
-            for fid in c.get("file_ids", []):
-                entry = self._data[data_key].get(fid)
-                if not entry or entry.get("missing"):
+        if include_combos:
+            for c in combos:
+                if c.get("kind") != kind:
                     continue
-                rec = AmountRecord.from_dict(entry.get("amount"))
-                amt = rec.final_amount
-                if amt is None:
+                if folder_set is not None:
+                    # 跨界组合（含选区外非 missing 成员）整组跳过
+                    out_of_scope = False
+                    for fid in c.get("file_ids", []):
+                        entry = self._data[data_key].get(fid)
+                        if entry and not entry.get("missing") and not _in_scope(entry):
+                            out_of_scope = True
+                            break
+                    if out_of_scope:
+                        continue
+                total = 0.0
+                has_amount = False
+                for fid in c.get("file_ids", []):
+                    entry = self._data[data_key].get(fid)
+                    if not entry or entry.get("missing"):
+                        continue
+                    rec = AmountRecord.from_dict(entry.get("amount"))
+                    amt = rec.final_amount
+                    if amt is None:
+                        continue
+                    total += amt
+                    has_amount = True
+                if not has_amount:
                     continue
-                total += amt
-                has_amount = True
-            if not has_amount:
-                continue
-            units.append({
-                "ids": list(c["file_ids"]),
-                "name": c.get("name", ""),
-                "amount": round(total, 2),
-                "is_combo": True,
-            })
+                units.append({
+                    "ids": list(c["file_ids"]),
+                    "name": c.get("name", ""),
+                    "amount": round(total, 2),
+                    "is_combo": True,
+                })
         return units
 
 
