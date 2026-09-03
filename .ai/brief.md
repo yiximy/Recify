@@ -1,74 +1,32 @@
-# 任务简报
+# 任务简报（修复轮 4：自动铺按发票单元聚合 + 空壳组合清理）
 
-## 当前任务
+## 问题 1（P1）：自动铺冗余——一对多应聚合为「1 发票模块 + 1 匹配模块 + N 支付模块」
 
-修复「比对关联模式」两个问题。版本回退点：`265bc72`（此前 commit），当前工作区已含上一次 5 问题修复（未提交）。
+**用户反馈**：一张发票 A 自动匹配 3 张支付记录时，当前自动铺出 3 条独立链（3 个匹配模块各连 1 张支付），冗余。期望：**1 个发票模块 → 1 个匹配模块 → 3 个支付模块**（匹配模块输出端可接多个支付模块）。
 
-## 问题 1：多选（含组合父行）时「取消所有关联」只对右键文件生效
+**规格变更**：
+1. **自动铺聚合**：按**发票侧单元**（单文件单元或组合单元）聚合所有候选——同一发票单元与多个同额支付单元匹配时只建 1 个匹配模块；连线 = 发票模块.out→匹配.in 一条；匹配.out → **每个**同额支付单元模块一条（多出线）。支付模块跨候选仍共享。多发票单元 × 多支付单元（多对多）→ 每个发票单元各自 1 个匹配模块（发票单元是聚合键）。
+2. **连线矩阵不变**（invoice.out→match.in、match.out→payment.in）。
+3. **执行/校验放宽**：匹配模块「恰 1 条发票入线」保持；支付出线由「恰 1」放宽为「≥1」（0 仍报错）；`executable_chains` 返回 (match, inv, [pays…])；确定管线 = 每匹配模块的发票单元 × **每个**出线支付单元逐一容差校验产 pair；跳过汇总逐支线。
+4. 节点/匹配模块金额显示 = 发票单元金额；接入摘要「支付 N 路」沿用（现有 items 已支持）。布局算法适配（match 列每发票单元 1 节点）。
+5. 回归注意：手动搭链时用户可能仍想一条链一个支付（现行为），放宽后手动连 1 个支付完全兼容；删单条支线 = 删 match→pay 线。
 
-**位置**：`app/ui/widgets/file_list_panel.py` `_on_tree_context_menu`
+## 问题 2（P2）：配置界面出现「已删除」的空壳组合
 
-**用户现象**：
-- 选中「16 个文件 + 1 个组合父行」→ 右键「取消所有关联」→ 弹出「确定要取消[高速费1.pdf]的全部关联吗？」（只对右键那个文件）
-- 取消选中组合父行 → 右键「取消所有关联」→ 弹出「确定要取消16个文件的全部关联吗？」（批量，正确）
+**用户反馈**：发票/支付模块配置界面的组合候选里，显示"以前组合过但已删除"的组合。
 
-**根因**（代码分析）：
-```python
-top_files = [
-    i for i in selected
-    if i.parent() is None and i.data(COL_SEQ, ROLE_FILE_ID)
-]
-multi = (
-    is_top_level
-    and len(top_files) >= 2
-    and len(top_files) == len(selected)
-)
-```
-组合父行是顶层项但**没有** `ROLE_FILE_ID`（只有 `ROLE_COMBO_ID`），所以当选中含组合父行时 `top_files` 少算一个 → `len(top_files) != len(selected)` → `multi=False` → 走单文件分支。
+**Root cause（Claude Code 实证，查了 data/store.json）**：3 个现存组合（安徽项目开发所使用的AI费用1 / 机票1+附加项 / 酒店住宿费）的**成员文件全部 missing**（源文件移除或文件夹切换重扫标记缺失）。组合记录本身未删——比对页树因成员全 missing 不显示其成员（观感像删了），而 `config_dialog` 的组合候选列表直接 `store.get_combos(kind)` **不过滤无效组合** → 空壳组合被列出来。
 
-**要求**：
-- 多选判定应把组合父行也纳入：选中的顶层项 = 顶层独立文件 + 组合父行（按 `ROLE_COMBO_ID` 识别）
-- 「取消所有关联」对组合父行应展开为**其全部成员文件**一起取消
-- 确认框文本：`确定要取消 N 个文件的全部关联吗？`（N = 独立文件数 + 组合成员数）
-- 完成提示：`已取消 N 个文件的全部关联，共 M 条`
-- 保持「定位所有」仍按单选/右键文件逻辑（不被多选影响）
-
-## 问题 2：父子行视觉区分不足（drawRow 颜色太浅）
-
-**位置**：`app/ui/widgets/file_list_panel.py` `_HierarchyTree.drawRow` + 配色常量
-
-**诊断结论（像素级验证）**：
-Claude Code 已用离屏渲染 + PIL 像素分析确认：**drawRow 代码本身生效**——截图中实际存在 4 种背景色：
-- `#ffffff` 独立文件行（RGB 255,255,255）
-- `#dce8fb` 关联子行（RGB 220,232,251）
-- `#ecf5ff` 组合父行（RGB 236,245,255）
-- `#f5f7fa` 成员行（RGB 245,247,250）
-
-但 4 种颜色与白色差异仅 10~35 RGB 值，肉眼几乎无法分辨，用户误以为"代码没生效"。
-
-**用户要求**：先用**红色**测试子行背景是否真正生效（例如关联子行用 `#ffdddd` 或更红），确认渲染通路没问题，再做最终配色。
-
-**要求**：
-1. **红色测试**：将关联对象子行背景临时改为明显红色（如 `#ffcccc`/`#ffdddd`，文字保持深色可读），成员行改为次明显色（如 `#fff3f3` 或保留浅灰加深），组合父行保持浅蓝加深——确保 4 层肉眼可辨
-2. 强调条加宽或加深（`_ACCENT_WIDTH` 可到 5-6px）
-3. 如果红色在真机仍不生效 → 排查是否被 QSS `QTreeWidget::item` 或主题覆盖（可改用 `setBackground` + 移除 QSS 的 `::item { background: transparent }`，或在 `drawRow` 中 super() 之后再 fillRect）
-4. 完成后再综合调色（可保留红色系或换回柔和的对比色系，但必须肉眼可辨）
-
-## 验收标准
-
-- [ ] 问题 1：多选（含组合父行）→「取消所有关联」→ 确认框提示全部文件数（独立+成员），全部解除
-- [ ] 问题 1：不含组合父行的多选行为不回归（仍批量）
-- [ ] 问题 2：真机截图/离屏像素验证 4 层背景色肉眼可辨（子行先用红色验证）
-- [ ] 全部通过 `bash scripts/check.sh`
-- [ ] 不破坏：定位/组合/批量关联/重命名/一键关联/自动比对审阅
+**修复规格**：
+1. **展示层**：config_dialog 组合候选（及 dialog 侧 `_find_combo_id` 反查）只接受「至少含 1 个非 missing 成员」的有效组合；无效组合不进候选列表。对部分成员缺失的组合可标注缺失成员数（若简单）。
+2. **治本（评审后定）**：为 store 增加空壳组合清理——建议在 `merge_invoices/merge_payments`（重扫合并后）自动移除「该 kind 下成员全部 missing」的组合（组合内文件已全部消失，保留无意义且引擎本就跳过）；需兼容 `config/app_config.json` 与 store 旧数据（setdefault 模式）。方案若涉及语义风险（自动删用户分组），codex 先在窗口说明取舍再实现。
+3. 行为一致：FileListPanel 树中组合父行显示逻辑不必改（现状 OK）；已有关联到全 missing 组合成员的关联不动。
 
 ## 相关文件
+- 问题 1：`match_flow/model.py`（executable_chains/validate/chain 结构）、`match_flow_dialog.py`（_build_candidate_chains/_layout_chains/_on_confirm）、`match_flow/items.py` 摘要若需适配
+- 问题 2：`match_flow/config_dialog.py`（候选过滤）、`app/core/store.py`（空壳清理，评审后）
+- 不改 data/store.json、config/app_config.json（用户数据只读——空壳清理作用于**未来** merge 行为，不清现有数据；现有 3 个空壳组合由用户在树中删除或不管）；不新增依赖；每次修改跑 `D:/Using_small_tools/Git/bin/bash.exe scripts/check.sh`；临时脚本用后清理；不 commit，交 Claude Code 审查 + 人类真机复验
 
-- `app/ui/widgets/file_list_panel.py`（两个问题都在这）
-
-## 备注
-
-- 先读 `AGENTS.md`、`CLAUDE.md`、本 brief，再写 `.ai/plan.md`
-- 不要改 `data/store.json` 和 `config/app_config.json`；不新增第三方依赖
-- 每次修改后跑 `bash scripts/check.sh`（Windows：`D:/Using_small_tools/Git/bin/bash.exe scripts/check.sh`）
-- 可参考 `_debug_shot.png`（离屏截图）和 `_debug_screenshot.py`（渲染脚本）验证配色；验证后清理这两个调试文件
+## 验证要求（Codex 必跑）
+- 问题 1：离屏临时 store 构造 1 发票单元 × 3 支付单元（同额）→ 自动铺 = 1 inv + 1 match + 3 pay、match.out 3 条；多对多（2×2）→ 2 match 各 2 出线；confirm 全量落库 4 条（2×2）；删一条支线后 confirm 3 条；渲染断言（色带 > 0 + 首屏相交）
+- 问题 2：临时 store 造成员全 missing 组合 + 有效组合 → config 候选仅含有效组合；merge 清理后 get_combos 不含空壳；check.sh 全绿
