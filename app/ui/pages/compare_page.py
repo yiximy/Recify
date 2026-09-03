@@ -2,8 +2,6 @@
 """比对关联页：左右双栏文件列表 + 双预览区 + 关联操作 + 自动比对"""
 from __future__ import annotations
 
-from typing import Optional
-
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
@@ -12,10 +10,9 @@ from PySide6.QtWidgets import (
 )
 from monkeyqt import MkButton, MkMessage
 
-from app.ui.widgets.auto_match_dialog import AutoMatchDialog
 from app.ui.widgets.file_list_panel import FileListPanel
+from app.ui.widgets.match_flow_dialog import MatchFlowDialog
 from app.ui.widgets.preview_view import PreviewView
-from app.ui.widgets.toggle_switch import ToggleSwitch
 
 
 class ComparePage(QWidget):
@@ -23,7 +20,7 @@ class ComparePage(QWidget):
 
     布局：
         ┌─────────────────────────────────────────┐
-        │ [自动比对]  [是否审阅 ⬜]                 │
+        │ [自动比对]                               │
         ├─────────────┬───────────────────────────┤
         │ 发票列表(PDF)│ 支付记录列表               │
         ├─────────────┴───────────────────────────┤
@@ -40,9 +37,6 @@ class ComparePage(QWidget):
         self._connect_signals()
         self._restore_state()
 
-        # 自动比对状态
-        self._match_pairs: list[dict] = []     # 待处理的匹配对列表
-        self._review_mode: bool = True         # 是否审阅模式（默认开启）
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -54,14 +48,9 @@ class ComparePage(QWidget):
         toolbar.setSpacing(16)
 
         self.btn_auto_match = MkButton("自动比对", type="primary")
-        self.btn_auto_match.setToolTip("基于金额自动匹配发票与支付记录")
+        self.btn_auto_match.setToolTip("打开流程画布：配置文件夹与匹配规则，按连接关系执行金额比对关联")
         self.btn_auto_match.clicked.connect(self._on_auto_match)
         toolbar.addWidget(self.btn_auto_match)
-
-        self.toggle_review = ToggleSwitch("是否审阅")
-        self.toggle_review.setChecked(True)
-        self.toggle_review.toggled.connect(self._on_review_toggled)
-        toolbar.addWidget(self.toggle_review)
 
         toolbar.addStretch()
 
@@ -209,64 +198,55 @@ class ComparePage(QWidget):
             self.btn_unlink.setEnabled(False)
             self.btn_rename.setEnabled(False)
 
-    def _on_review_toggled(self, checked: bool):
-        """审阅模式开关切换。"""
-        self._review_mode = checked
-        if checked:
-            self.btn_auto_match.setText("自动比对")
-            self.btn_auto_match.setToolTip("弹出关联组审阅界面：自动识别金额匹配项，人工调整后批量确认")
-        else:
-            self.btn_auto_match.setText("一键自动关联")
-            self.btn_auto_match.setToolTip("自动关联所有金额相同的发票与支付记录")
 
     # ── 自动比对 ──────────────────────────────────────────
 
     def _on_auto_match(self):
-        """自动比对入口：根据审阅模式分派不同逻辑。"""
+        """自动比对入口：打开流程画布，配置后执行批量自动关联。"""
         if not self.store:
             MkMessage.warning(self, "数据未初始化")
             return
 
-        # 获取金额匹配的对
-        self._match_pairs = self.store.get_amount_matches()
-
-        if not self._match_pairs:
-            MkMessage.success(self, "未找到金额匹配的未关联配对。\n请先在「计算金额模式」中为发票和支付记录完成 OCR 识别。")
-            self.lbl_match_progress.setText("")
-            return
-
-        if self._review_mode:
-            self._open_auto_match_dialog()
-        else:
-            self._start_auto_link_mode()
-
-    def _open_auto_match_dialog(self):
-        """审阅模式：弹出模态二级界面，确认后批量自动关联。"""
-        dialog = AutoMatchDialog(self._match_pairs, store=self.store, parent=self)
+        dialog = MatchFlowDialog(store=self.store, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            self._match_pairs = []
-            self.lbl_match_progress.setText("")
             return
 
-        pairs = dialog.accepted_pairs()
-        total = len(pairs)
-        count = self.store.batch_link(pairs, auto_linked=True)
-        self._match_pairs = []
-        self.btn_link.setText("关联选中项")
-        self.btn_link.setEnabled(False)
-        self.lbl_match_progress.setText(
-            f"自动比对已保存：{count} / {total} 对"
-        )
-
-        if count > 0:
+        result = dialog.result_summary or {}
+        if not result.get("found"):
             MkMessage.success(
                 self,
-                f"自动比对已保存，成功关联 {count} / {total} 对。",
+                "未找到金额匹配的未关联配对。\n"
+                "请先在「计算金额模式」中为发票和支付记录完成 OCR 识别。",
             )
-        else:
-            MkMessage.warning(self, "没有新增关联，可能这些配对已被关联。")
+            self.lbl_match_progress.setText("")
+            return
 
+        total = result.get("total", 0)
+        count = result.get("count", 0)
+        skipped = result.get("skipped", 0)
+        skip_reasons = result.get("skip_reasons") or []
+        if count > 0:
+            text = f"自动比对完成：新增 {count} 条关联（覆盖 {total} 条候选支线）。\n" \
+                "自动关联的文件已在列表中标记。"
+            if skipped:
+                text += f"\n跳过 {skipped} 条支线（金额差超出容差或无金额）。"
+            MkMessage.success(self, text)
+            progress = f"自动比对已保存：新增 {count} 条关联"
+            if skipped:
+                progress += f"（跳过 {skipped} 条支线）"
+            self.lbl_match_progress.setText(progress)
+        else:
+            if skipped and skip_reasons:
+                MkMessage.warning(
+                    self,
+                    f"没有新增关联（跳过 {skipped} 条支线）：\n\n"
+                    + "\n".join(skip_reasons[:5]),
+                )
+            else:
+                MkMessage.warning(self, "没有新增关联，可能这些配对已被关联。")
+            self.lbl_match_progress.setText("")
         self._update_link_buttons()
+
 
     def _on_link(self):
         """手动关联选中的发票与支付记录（支持组合↔文件 / 组合↔组合批量关联）。"""
@@ -303,30 +283,6 @@ class ComparePage(QWidget):
             )
         self._update_link_buttons()
 
-    def _start_auto_link_mode(self):
-        """一键自动关联模式：批量关联所有金额匹配对，并添加标记。"""
-        if not self._match_pairs:
-            return
-
-        total = len(self._match_pairs)
-        count = self.store.batch_link(self._match_pairs, auto_linked=True)
-
-        self.lbl_match_progress.setText(
-            f"自动关联完成：{count} / {total} 对"
-        )
-
-        if count > 0:
-            MkMessage.success(
-                self,
-                f"一键自动关联完成！\n"
-                f"成功关联 {count} 对（共 {total} 对候选）。\n"
-                f"自动关联的文件已在列表中标记。",
-            )
-        else:
-            MkMessage.warning(self, "未能关联任何配对，可能已被关联。")
-
-        self._match_pairs = []
-        self._update_link_buttons()
 
     # ── 关联操作（手动）────────────────────────────────────
 
