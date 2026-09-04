@@ -489,3 +489,50 @@ def _on_confirm():
 - 改动：`match_flow/model.py`（绑定字段 + can_connect/validate/chains）、`items.py`（信息行/徽标 + 命名）、`canvas.py`（linking 目标按源 kind、引导文案）、`config_dialog.py`（绑定多选控件 + 冲突禁用 + 匹配容差）、`match_flow_dialog.py`（palette 中性化 + 打开即自动铺入口）、`compare_page.py`（结果文案含跳过数，微调）。
 - 不做：文件夹绑定/FolderPicker/文件数统计、`include_combos` 开关、自动布点优化、画布配置持久化；`store.py` 引擎与 `merge_* mark_missing` 分支**不改不动**。
 - 删除项（v1 残留）：`FlowNode.folder`、palette 彩色图标（`_kind_icon` 与拖拽 pixmap 中性白底）、`_PALETTE_ITEMS` 中文件夹描述文案。
+
+---
+
+## 2026-09-04 追加：端口级拖线判定 + 模块库着色 + 对话框最大化（本轮实现方案）
+
+> 来源：`.ai/brief.md`（三个问题规格已定稿）。改动文件：`items.py` / `canvas.py` /
+> `match_flow_dialog.py`；不改 `model.py` can_connect 矩阵、执行语义与 store。
+
+### 问题 1：拖线目标按「端口侧」命中与高亮（P1）
+- 端口侧三分：以目标模块卡片中线（`NODE_W/2`）为界，左半 = 输入侧、右半 = 输出侧；
+  中线左右 ±`_MID_BAND`(6px) 窄带 = 中部（意图不明 → 无效）。左右半各含端口 ±容差。
+- 合法性 = kind 矩阵（沿用 `_is_valid_link_target`，矩阵未动）∧ 命中侧匹配：
+  - 发起 out（正向）= 目标模块**输入侧**（inv.out→match.in / match.out→payment.in）；
+  - 发起 in（反向）= 目标模块**输出侧**（拖 payment.in 找 match.out、拖 match.in 找 invoice.out）；
+  - 中部 / kind 不符 / 侧别不符 → 红临时线、无高亮、释放不建线（红字给侧别提示）。
+- items：`_link_target` 拆为 `_link_target_in`/`_link_target_out`，paint 按命中侧亮对应端口；
+  合法目标统一沿用绿色卡片描边（`_GREEN`，与旧正向一致；invoice 悬停不再与选中蓝混淆）。
+- canvas：`_target_side()` 归类 + `_link_validity()` 判定（update_temp 与 finish_link 共用，
+  保证释放与悬停同口径）；`_set_hover_target(item, side)` 按侧置位；`_hover_side` 记录。
+- 说明/取舍：正向 UX 由「整模块可落」收紧为「须落输入侧（左半）」，这是规格要求的按侧判定；
+  悬停发票/支付（kind 非法）行为与旧一致。
+
+### 问题 2：模块库三项彩色卡片（P2）
+- 复用画布节点同一语义色 `items.STYLE`（发票蓝 #409eff/#ecf5ff、支付绿 #67c23a/#f0f9eb、
+  匹配橙 #e6a23c/#fdf6ec）：图标 = 主色、卡片底 = 浅底、边框 = 主色；
+  hover/选中 = 主色向浅底加深（`_blend`）+ 边框加粗（1.5/2.0）。
+- 每项 `DecorationRole` 按 kind 生成 `_kind_icon`；拖拽 pixmap 图标同步用 kind 主色。
+- 结构与 QDrag/mime 协议不变（UserRole=kind、MIME_NODE 不变）；选中/hover 文字仍灰阶。
+- 替换中性化（旧常量 `_PALETTE_CARD_*`/`_neutral_icon` 删除），符合最新人类改主意。
+
+### 问题 3：MatchFlowDialog 打开最大化（P2）
+- 构造期 `_fit_available_screen()`：优先取父窗口所在屏幕 availableGeometry 铺满
+  （exec 前即有满屏尺寸）；小于 min size 时退回 1580×920 由最小尺寸兜底。
+- `showEvent` 首次 `QTimer.singleShot(0, showMaximized)`（延迟一拍防重入）→ 真最大化。
+- min size 保留 1280×680；离屏/极小屏由 isMaximized 或尺寸覆盖可用屏双口径断言。
+- 三列布局常量：**维持现 360 列距不变**（评估取舍：自动铺只在打开时铺一次，无法等
+  最大化后再算布局；再拉开会让最小宽 1280 窗口出现横向滚动、支付多行换行错位。
+  最大化后的横向留白由画布自适应/平移缩放消化，簇保持纵向堆叠）。
+
+### 验证（2026-09-04，offscreen）
+- 问题1：真实 MatchFlowDialog + viewport QMouseEvent 模拟 5 条路径 26 断言全过：
+  反向支付.in→匹配输出侧高亮/建线、反向悬匹配输入侧红/不建线、反向匹配.in→发票输出侧建线、
+  正向 inv.out→匹配输入侧回归、中部悬停无效；截图像素佐证（无效红 302px、合法绿边/端口高亮）。
+- 问题2：整窗与逐行像素断言 蓝/绿/橙 主色 + 浅底均 >0（发票 172/7524、支付 172/7472、
+  匹配 172/7608），选中行仍含类型主色；截图 `_tmp_diag/palette_colored.png`。
+- 问题3：min size 保留、show 后 isMaximized=True（可用屏覆盖断言通过）、布局不崩、远端节点可滚动。
+- `bash scripts/check.sh` 全绿。临时脚本已清理；`_tmp_diag/` 截图留 Claude 审后删。
