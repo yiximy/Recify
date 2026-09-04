@@ -42,6 +42,12 @@ from .model import (
 # 侧边栏拖放 mime 类型（data 存模块 kind）
 MIME_NODE = "application/x-recity-node"
 
+# 拖线目标端口侧（端口级命中）：左半=输入侧、右半=输出侧、中线附近=中部
+_SIDE_IN = "in"
+_SIDE_OUT = "out"
+_SIDE_MID = "mid"
+_MID_BAND = 6.0      # 模块中线两侧窄带判为「中部」（意图不明 → 无效）
+
 _GRID_COLOR = QColor("#e3e7ee")
 _BG_COLOR = QColor("#f5f7fa")
 
@@ -87,8 +93,10 @@ class FlowScene(QGraphicsScene):
         # linking 状态
         self._linking = False
         self._link_src_id: Optional[str] = None
+        self._link_from_input = False    # True=从输入端口反向发起（本模块作 dst）
         self._temp_wire: Optional[FlowWireItem] = None
         self._hover_target_id: Optional[str] = None
+        self._hover_side: Optional[str] = None   # 悬停目标命中的端口侧（in/out）
         self._selected_wire_id: Optional[str] = None
         self._scene_rect_set = False   # 场景矩形是否已显式设置（_expand 首次留白判定）
 
@@ -169,8 +177,13 @@ class FlowScene(QGraphicsScene):
     def is_linking(self) -> bool:
         return self._linking
 
-    def begin_link(self, src_id: str):
-        """从输出端口开始拖线（由 FlowNodeItem 按下调用）。"""
+    def begin_link(self, src_id: str, from_input: bool = False):
+        """从端口开始拖线（由 FlowNodeItem 按下调用）。
+
+        from_input=False：从输出端口发起，本模块作 src，目标为下游；
+        from_input=True：从输入端口反向发起，本模块作 dst，目标为上游模块
+        （创建时真实方向 = can_connect(目标, 本模块)，矩阵方向不变）。
+        """
         if self._linking:
             self.cancel_link()
         src_item = self.node_item(src_id)
@@ -178,10 +191,16 @@ class FlowScene(QGraphicsScene):
             return
         self._linking = True
         self._link_src_id = src_id
-        src_item._link_source = True
+        self._link_from_input = from_input
+        if from_input:
+            src_item._link_input = True
+        else:
+            src_item._link_source = True
         self._temp_wire = FlowWireItem(temp=True)
         self.addItem(self._temp_wire)
-        self._temp_wire.set_endpoints(src_item.out_port_pos(), src_item.out_port_pos())
+        p0 = (src_item.in_port_pos() if from_input
+              else src_item.out_port_pos())
+        self._temp_wire.set_endpoints(p0, p0)
         src_item.update()
         if self._canvas is not None:
             self._canvas.setFocus()
@@ -195,38 +214,93 @@ class FlowScene(QGraphicsScene):
             return dst_kind == KIND_PAYMENT
         return False
 
+    def _target_side(self, item: FlowNodeItem, scene_pos: QPointF) -> str:
+        """悬停点归类目标端口侧：左半输入 / 右半输出；中线 ±_MID_BAND 窄带为中部（无效）。"""
+        local = scene_pos - item.pos()
+        half = NODE_W / 2.0
+        if abs(local.x() - half) <= _MID_BAND:
+            return _SIDE_MID
+        return _SIDE_IN if local.x() < half else _SIDE_OUT
+
+    def _link_validity(self, target: Optional[FlowNodeItem],
+                       scene_pos: QPointF) -> tuple[bool, str]:
+        """判定悬停/释放合法性（发起端口侧×目标端口侧），返回 (合法, 命中侧)。
+
+        正向（out 发起）= 下游模块输入侧；反向（in 发起）= 上游模块输出侧；
+        目标 None/中部/kind 不符/侧别不符均非法（红临时线、无高亮、不建线，仍走兜底）。
+        """
+        if target is None:
+            return False, _SIDE_MID
+        side = self._target_side(target, scene_pos)
+        if side == _SIDE_MID:
+            return False, side
+        src = self.model.get_node(self._link_src_id or "")
+        if src is None:
+            return False, side
+        if self._link_from_input:
+            kind_ok = self._is_valid_link_target(target.node.kind, src.kind)
+            expect = _SIDE_OUT
+        else:
+            kind_ok = self._is_valid_link_target(src.kind, target.node.kind)
+            expect = _SIDE_IN
+        return (kind_ok and side == expect), side
+
     def update_temp(self, scene_pos: QPointF):
-        """拖线移动：更新临时线终点与合法目标高亮。"""
+        """拖线移动：更新临时线终点与端口级合法目标高亮。"""
         if not self._linking or self._temp_wire is None:
             return
         src_item = self.node_item(self._link_src_id or "")
-        src = self.model.get_node(self._link_src_id or "") if self._link_src_id else None
-        if src_item is None or src is None:
+        if src_item is None:
             return
-        self._temp_wire.set_endpoints(src_item.out_port_pos(), scene_pos)
+        p0 = (src_item.in_port_pos() if self._link_from_input
+              else src_item.out_port_pos())
+        self._temp_wire.set_endpoints(p0, scene_pos)
         target = self._top_node_at(scene_pos)
-        valid = target is not None and self._is_valid_link_target(
-            src.kind, target.node.kind)
+        valid, side = self._link_validity(target, scene_pos)
         self._temp_wire.set_invalid(not valid)
-        self._set_hover_target(target if valid else None)
+        self._set_hover_target(target if valid else None,
+                               side if valid else None)
 
     def finish_link(self, scene_pos: QPointF):
-        """松开鼠标：命中合法目标则建线，否则取消并给出原因。"""
+        """松开鼠标：命中合法端口侧目标才建线，否则取消并给出原因。"""
         if not self._linking:
             return
         src_id = self._link_src_id or ""
         target = self._top_node_at(scene_pos)
-        if target is not None:
-            wire = self.create_wire(src_id, target.node.node_id)
-            if wire is not None:
-                self._status(
-                    f"已连接：{self._node_name(src_id)} → {self._node_name(wire.dst_id)}",
-                    True,
-                )
+        valid, side = self._link_validity(target, scene_pos)
+        if target is not None and valid:
+            if self._link_from_input:
+                wire = self.create_wire(target.node.node_id, src_id)
+                if wire is not None:
+                    self._status(
+                        f"已连接：{self._node_name(wire.src_id)} → "
+                        f"{self._node_name(wire.dst_id)}",
+                        True,
+                    )
+                else:
+                    self._status(self._input_link_reason(src_id, target), False)
             else:
-                _can, reason = self.model.can_connect(
-                    src_id, target.node.node_id)
-                self._status(reason or "无法建立连线", False)
+                wire = self.create_wire(src_id, target.node.node_id)
+                if wire is not None:
+                    self._status(
+                        f"已连接：{self._node_name(src_id)} → "
+                        f"{self._node_name(wire.dst_id)}",
+                        True,
+                    )
+                else:
+                    _can, reason = self.model.can_connect(
+                        src_id, target.node.node_id)
+                    self._status(reason or "无法建立连线", False)
+        elif target is not None:
+            # 命中模块但端口侧/kind 不合法：红字说明，不建线
+            if self._link_from_input:
+                self._status(self._input_link_reason(src_id, target), False)
+            else:
+                _can, reason = self.model.can_connect(src_id, target.node.node_id)
+                if _can:
+                    self._status(self._side_reason(from_input=False), False)
+                else:
+                    self._status(reason or "无法建立连线", False)
         self._cleanup_link()
 
     def cancel_link(self):
@@ -234,12 +308,32 @@ class FlowScene(QGraphicsScene):
         if self._linking:
             self._cleanup_link()
 
+    @staticmethod
+    def _side_reason(from_input: bool) -> str:
+        """端口侧不匹配时的用户侧红字提示（kind 合法但落错侧/中部）。"""
+        if from_input:
+            return "反向连接：请把连线拖到上游模块的输出侧（右半）再松开"
+        return "请把连线拖到目标模块的输入侧（左半）再松开"
+
+    def _input_link_reason(self, dst_id: str, target: FlowNodeItem) -> str:
+        """输入端口反向发起、释放到非法目标时的用户侧红字原因。"""
+        dst = self.model.get_node(dst_id)
+        if dst is not None and dst.kind == KIND_INVOICE:
+            # 发票是链首，任何模块都不能作为它的上游（无入线）
+            return "发票模块输入端不接受连线：发票是链首，只能从输出端引出"
+        _can, reason = self.model.can_connect(target.node.node_id, dst_id)
+        if _can:
+            # kind 合法但落在错误侧/中部 → 指向正确侧
+            return self._side_reason(from_input=True)
+        return reason or "无法建立该连线"
+
     def _cleanup_link(self):
         src_id = self._link_src_id
         if src_id is not None:
             src_item = self.node_item(src_id)
             if src_item is not None:
                 src_item._link_source = False
+                src_item._link_input = False
                 src_item.update()
         if self._temp_wire is not None:
             self.removeItem(self._temp_wire)
@@ -247,16 +341,22 @@ class FlowScene(QGraphicsScene):
         self._set_hover_target(None)
         self._linking = False
         self._link_src_id = None
+        self._link_from_input = False
 
-    def _set_hover_target(self, item: Optional[FlowNodeItem]):
+    def _set_hover_target(self, item: Optional[FlowNodeItem],
+                          side: Optional[str] = None):
+        """置/清端口级悬停目标：按命中侧亮目标模块对应端口（_link_target_in/out）。"""
         if self._hover_target_id is not None:
             old = self.node_item(self._hover_target_id)
             if old is not None:
-                old._link_target = False
+                old._link_target_in = False
+                old._link_target_out = False
                 old.update()
         self._hover_target_id = item.node.node_id if item is not None else None
+        self._hover_side = side
         if item is not None:
-            item._link_target = True
+            item._link_target_in = side == _SIDE_IN
+            item._link_target_out = side == _SIDE_OUT
             item.update()
 
     def _top_node_at(self, scene_pos: QPointF) -> Optional[FlowNodeItem]:

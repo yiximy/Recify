@@ -84,7 +84,8 @@ class FlowNodeItem(QGraphicsItem):
     """模块节点卡片：色带头 + 名称/信息行 + 金额徽标 + 左右端口。
 
     交互（由场景协调）：
-        - 在输出端口按下 → 开始拖出连线（scene.begin_link）
+        - 在输出/输入端口按下 → 开始拖出连线（scene.begin_link；输入端为反向发起，
+          连线方向仍按发票→匹配→支付）
         - 卡片其它区域按下 → 默认可移动（ItemIsMovable）
         - 双击 → 打开配置（scene 转成 nodeConfigRequested 信号）
         - 右键 → 节点菜单（配置…/删除模块）
@@ -98,8 +99,10 @@ class FlowNodeItem(QGraphicsItem):
         self._inv_in = 0              # 匹配模块：发票入线数
         self._pay_out = 0             # 匹配模块：支付出线数
         self._match_amount: Optional[float] = None   # 匹配模块：链金额（场景刷新注入）
-        self._link_target = False     # 连线拖拽悬停在本节点（合法目标高亮）
-        self._link_source = False     # 正在从此节点输出拖线
+        self._link_target_in = False   # 连线拖拽悬停：本节点输入侧为合法目标（亮左端口）
+        self._link_target_out = False  # 连线拖拽悬停：本节点输出侧为合法目标（亮右端口）
+        self._link_source = False      # 正在从此节点输出端口正向拖线（右端口高亮）
+        self._link_input = False       # 正在从此节点输入端口反向拖线（左端口高亮）
         self._press_scene = QPointF()  # 记录按下点（防双击误拖）
         self._moved = False
         # 源模块派生显示（refresh_content 计算缓存，paint 只读）
@@ -259,13 +262,18 @@ class FlowNodeItem(QGraphicsItem):
             lines.append(f"金额容差：±{tol:g} 元")
             lines.append(f"链金额：{_fmt_amount(self._match_amount)}")
             lines.append(f"接入：发票 {self._inv_in} 路 → 支付 {self._pay_out} 路")
-        lines.append("双击配置 · 右键菜单 · 拖动可移动")
+        lines.append("左右端口均可拖动连接 · 双击配置 · 右键菜单 · 节点可拖动")
         return "\n".join(lines)
 
     # ── 交互 ──
 
     def _hit_output_port(self, local: QPointF) -> bool:
         c = QPointF(NODE_W, NODE_H / 2.0)
+        return (local - c).manhattanLength() <= 16
+
+    def _hit_input_port(self, local: QPointF) -> bool:
+        """输入端口（左缘中点）命中：按下即反向发起拖线。"""
+        c = QPointF(0.0, NODE_H / 2.0)
         return (local - c).manhattanLength() <= 16
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
@@ -289,6 +297,16 @@ class FlowNodeItem(QGraphicsItem):
                 scene = self.scene()
                 if scene is not None and hasattr(scene, "begin_link"):
                     scene.begin_link(self.node.node_id)
+                event.accept()
+                return
+            if self._hit_input_port(event.pos()):
+                # 输入端口反向发起：连线方向不变，最终方向由
+                # scene.begin_link(from_input=True) 按 can_connect(目标, 本模块) 判定
+                self._moved = False
+                self._press_scene = event.scenePos()
+                scene = self.scene()
+                if scene is not None and hasattr(scene, "begin_link"):
+                    scene.begin_link(self.node.node_id, from_input=True)
                 event.accept()
                 return
             self._moved = False
@@ -412,8 +430,8 @@ class FlowNodeItem(QGraphicsItem):
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                              self._badge_text)
 
-        # 连线悬停合法目标高亮：卡片描绿边
-        if self._link_target:
+        # 连线悬停合法目标高亮：命中侧端口 + 卡片描绿边（合法目标统一用绿色描边）
+        if self._link_target_in or self._link_target_out:
             painter.setPen(QPen(_GREEN, 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(card.adjusted(1, 1, -1, -1), _RADIUS, _RADIUS)
@@ -424,11 +442,11 @@ class FlowNodeItem(QGraphicsItem):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(card.adjusted(1, 1, -1, -1), _RADIUS, _RADIUS)
 
-        # 端口
+        # 端口（左=输入：悬停「输入侧」合法目标/反向拖线源高亮；右=输出：悬停「输出侧」合法目标/正向拖线源高亮）
         self._draw_port(painter, QPointF(0.0, NODE_H / 2.0), accent,
-                        self._link_target)
+                        self._link_target_in or self._link_input)
         self._draw_port(painter, QPointF(NODE_W, NODE_H / 2.0), accent,
-                        self._link_source, output=True)
+                        self._link_target_out or self._link_source, output=True)
 
     def _draw_port(self, painter: QPainter, center: QPointF,
                    accent: QColor, active: bool, output: bool = False):

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """自动比对 · 流程画布对话框（v2 文件粒度 + 按发票单元聚合自动铺）。
 
-布局：左侧「模块库」（中性白底，可拖入画布） + QGraphicsScene 画布 + 底部状态/按钮。
+布局：左侧「模块库」（按模块类型着色的卡片，可拖入画布） + QGraphicsScene 画布 + 底部状态/按钮。
 打开时：若存在金额匹配的未关联候选，按「发票单元」聚合自动铺——
 同一发票单元与多个同额支付单元匹配时只建 1 个匹配模块（发票→匹配 1 条入线、
 匹配→每个同额支付单元 1 条出线）；多发票单元 × 多支付单元 → 每发票单元各自
@@ -35,7 +35,7 @@ from monkeyqt import MkButton, MkMessage
 
 from app.ui.widgets.match_flow.canvas import FlowCanvas, MIME_NODE
 from app.ui.widgets.match_flow.config_dialog import NodeConfigDialog
-from app.ui.widgets.match_flow.items import NODE_H, NODE_W
+from app.ui.widgets.match_flow.items import NODE_H, NODE_W, STYLE as NODE_STYLE
 from app.ui.widgets.match_flow.model import (
     FlowModel,
     KIND_INVOICE,
@@ -75,40 +75,48 @@ QListWidget {
 }
 """
 
-# 模块库卡片常量（MonkeyQt Elegant Light 浅色一致的圆角浅底卡片；
-# 中性化：不用类型彩色做分类，仅用状态色区分 hover/选中）
+# 模块库卡片常量：按 kind 用画布节点同一语义色（发票蓝 #409eff/支付绿 #67c23a/
+# 匹配橙 #e6a23c + 各自浅底）着色图标/卡片底/边框；hover/选中由类型色加深表达，
+# 文字保持 Elegant Light 灰阶（卡片结构与 QDrag/mime 协议不变）。
 _PALETTE_DESC_ROLE = Qt.ItemDataRole.UserRole + 1   # 行描述（类型说明小字）
-_PALETTE_CARD_BG = "#f7f9fc"
-_PALETTE_CARD_BORDER = "#e4e7ed"
-_PALETTE_HOVER_BG = "#ecf5ff"
-_PALETTE_HOVER_BORDER = "#c6e2ff"
-_PALETTE_SEL_BG = "#d9ecff"
-_PALETTE_SEL_BORDER = "#79bbff"
 _PALETTE_TITLE = "#303133"
 _PALETTE_DESC = "#909399"
-_PALETTE_ICON = "#c0c4cc"
 
 
-def _neutral_icon() -> QIcon:
-    """模块库中性小图标（纯灰圆角方块，不用类型彩色）。"""
+def _blend(a: QColor, b: QColor, t: float) -> QColor:
+    """把颜色 a 向 b 混合比例 t（hover/选中时用类型色加深浅底）。"""
+    def _mix(x: int, y: int) -> int:
+        return int(round(x + (y - x) * t))
+    return QColor(_mix(a.red(), b.red()), _mix(a.green(), b.green()),
+                  _mix(a.blue(), b.blue()), a.alpha())
+
+
+def _kind_palette(kind: str) -> dict:
+    """按 kind 取模块库卡片语义色（accent 主色 / bg 浅底，与画布节点同一套色）。"""
+    style = NODE_STYLE.get(kind, NODE_STYLE[KIND_MATCH])
+    return {"accent": QColor(style["accent"]), "bg": QColor(style["bg"])}
+
+
+def _kind_icon(kind: str) -> QIcon:
+    """模块库类型色小图标（圆角方块，用该 kind 的主色）。"""
     pm = QPixmap(16, 16)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(_PALETTE_ICON))
+    painter.setBrush(_kind_palette(kind)["accent"])
     painter.drawRoundedRect(1, 1, 14, 14, 4, 4)
     painter.end()
     return QIcon(pm)
 
 
 class _PaletteCardDelegate(QStyledItemDelegate):
-    """模块库卡片代理：自绘「模块名 + 类型说明小字」两行圆角浅底卡片。
+    """模块库卡片代理：自绘「模块名 + 类型说明小字」两行圆角卡片，按 kind 着色。
 
     QListWidgetItem 的文本只能单行绘制（换行会被归一化为 U+2028 且不折行），
     QSS ::item 无法承载两行结构，故卡片背景/边框/hover/选中反馈在此自绘；
-    视觉采用 MonkeyQt Elegant Light 浅色风格（#f7f9fc / #e4e7ed / hover #ecf5ff）。
-    _PaletteList 的 QDrag + mime 拖拽协议保持不变（text=模块名、UserRole=kind）。
+    卡片底色/边框/图标取该 kind 的语义色（发票蓝/支付绿/匹配橙），hover/选中
+    用类型色加深表达。_PaletteList 的 QDrag + mime 拖拽协议保持不变。
     """
 
     _ROW_H = 56          # 行高（卡片 + 上下 margin）
@@ -119,27 +127,31 @@ class _PaletteCardDelegate(QStyledItemDelegate):
     def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
         return QSize(160, self._ROW_H)
 
-    @staticmethod
-    def _pick_colors(option: QStyleOptionViewItem) -> tuple[str, str]:
-        """按状态取 (背景, 边框)：选中优先，其次 hover。"""
+    def _palette_colors(self, option: QStyleOptionViewItem,
+                        index) -> tuple[QColor, QColor, float]:
+        """按 kind 与状态取 (底色, 边框色, 边框宽)：选中优先，其次 hover。"""
+        colors = _kind_palette(
+            str(index.data(Qt.ItemDataRole.UserRole)) or KIND_MATCH)
+        accent = colors["accent"]
+        light = colors["bg"]
         state = option.state
         if state & QStyle.StateFlag.State_Selected:
-            return _PALETTE_SEL_BG, _PALETTE_SEL_BORDER
+            return _blend(light, accent, 0.45), accent, 2.0
         if state & QStyle.StateFlag.State_MouseOver:
-            return _PALETTE_HOVER_BG, _PALETTE_HOVER_BORDER
-        return _PALETTE_CARD_BG, _PALETTE_CARD_BORDER
+            return _blend(light, accent, 0.22), accent, 1.5
+        return light, accent, 1.0
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
         card = option.rect.adjusted(self._MARGIN, self._MARGIN,
                                     -self._MARGIN, -self._MARGIN)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        # 卡片底 + 边框
-        bg, border = self._pick_colors(option)
-        painter.setPen(QPen(QColor(border), 1))
-        painter.setBrush(QColor(bg))
+        # 卡片底 + 边框（按 kind 取类型色，状态加深底/加粗边框）
+        bg, border, border_w = self._palette_colors(option, index)
+        painter.setPen(QPen(border, border_w))
+        painter.setBrush(bg)
         painter.drawRoundedRect(QRectF(card), self._RADIUS, self._RADIUS)
-        # 中性图标
+        # 类型色图标（DecorationRole 已在 populate 时按 kind 生成）
         icon = index.data(Qt.ItemDataRole.DecorationRole)
         if icon is not None and not icon.isNull():
             icon_rect = QRect(card.left() + 8, card.top() + 6,
@@ -179,7 +191,7 @@ class _PaletteCardDelegate(QStyledItemDelegate):
 
 
 class _PaletteList(QListWidget):
-    """模块库列表：中性卡片行 + 手动拖拽（QDrag + mime），拖入画布生成节点。"""
+    """模块库列表：类型色卡片行 + 手动拖拽（QDrag + mime），拖入画布生成节点。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -227,7 +239,7 @@ class _PaletteList(QListWidget):
         painter = QPainter(pm)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#c0c4cc"))
+        painter.setBrush(_kind_palette(kind)["accent"])
         painter.drawRoundedRect(4, 8, 14, 14, 4, 4)
         painter.setPen(QColor("#303133"))
         painter.drawText(26, 12, 150, 18,
@@ -251,8 +263,9 @@ class MatchFlowDialog(QDialog):
 
         self.setWindowTitle("自动比对 · 流程画布")
         self.setModal(True)
-        self.resize(1580, 920)
         self.setMinimumSize(1280, 680)
+        self._maximize_requested = False   # 首次显示后置最大化（只做一次）
+        self._fit_available_screen()
         self.setStyleSheet(_DIALOG_QSS)
         self._build_ui()
         self._connect()
@@ -260,6 +273,40 @@ class MatchFlowDialog(QDialog):
         if self.store is not None:
             self.canvas.flow_scene.set_store(self.store)
             self._auto_place()
+
+    # ── 窗口铺满可用屏幕（与主界面最大化观感一致）──
+
+    def _available_geometry(self) -> Optional[QRect]:
+        """确定目标屏幕的可用矩形：优先取父窗口所在屏幕，回退主屏。"""
+        screen = self.parentWidget().screen() \
+            if self.parentWidget() is not None else None
+        if screen is None:
+            screen = self.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _fit_available_screen(self) -> None:
+        """构造期先按可用屏幕铺满（exec 前即有满屏尺寸）；show 后再真正最大化。
+
+        可用屏小于最小尺寸（极小屏/离屏测试）时退回默认 1580×920 由最小尺寸兜底。
+        """
+        geo = self._available_geometry()
+        if geo is not None and geo.width() >= self.minimumWidth() \
+                and geo.height() >= self.minimumHeight():
+            self.resize(geo.width(), geo.height())
+        else:
+            self.resize(1580, 920)
+
+    def showEvent(self, event):
+        """首次显示后置为最大化：走窗口管理器，可用屏占比与主界面一致。
+
+        QTimer 延迟一拍避免在 show 过程中重入（Qt 惯例），对话框打开即占满。
+        """
+        super().showEvent(event)
+        if not self._maximize_requested:
+            self._maximize_requested = True
+            QTimer.singleShot(0, self.showMaximized)
 
     # ── UI ──
 
@@ -316,9 +363,8 @@ class MatchFlowDialog(QDialog):
         return panel
 
     def _populate_palette(self):
-        icon = _neutral_icon()
         for kind, name, desc in _PALETTE_ITEMS:
-            item = QListWidgetItem(icon, name)
+            item = QListWidgetItem(_kind_icon(kind), name)
             item.setData(Qt.ItemDataRole.UserRole, kind)
             item.setData(_PALETTE_DESC_ROLE, desc)
             item.setToolTip(desc)
