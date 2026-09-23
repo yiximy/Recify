@@ -13,6 +13,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
@@ -43,14 +44,20 @@ HEADER_H = 26
 PORT_R = 6
 _PORT_HOVER_R = 9
 _MARGIN = PORT_R + 4          # 卡片外留白，容纳端口/选中描边
+_SHADOW_MARGIN = 10.0         # 阴影绘制区；不参与 sceneRect 计算
+_SHADOW_OFFSET = 2.0
+_SHADOW_COLOR = QColor(48, 49, 51, 28)
+_SHADOW_SOFT_COLOR = QColor(48, 49, 51, 12)
 _RADIUS = 8
 
 # 连线配色
-_WIRE_COLOR = QColor("#a8b2c1")
-_WIRE_HOVER = QColor("#409eff")
+_WIRE_COLOR = QColor("#a8b2c1")   # 无来源类型时的兜底色
 _WIRE_INVALID = QColor("#f56c6c")
 _WIRE_TEMP = QColor("#409eff")
-_WIRE_WIDTH = 2.0
+_WIRE_WIDTH = 3.0
+_WIRE_HIGHLIGHT_WIDTH = 4.0
+_WIRE_HOVER_LIGHTEN = 125
+_WIRE_SELECTED_LIGHTEN = 150
 
 _TEXT_DARK = QColor("#303133")
 _TEXT_GRAY = QColor("#909399")
@@ -135,8 +142,13 @@ class FlowNodeItem(QGraphicsItem):
     # ── 几何 ──
 
     def boundingRect(self) -> QRectF:
-        return QRectF(-_MARGIN, -_MARGIN,
-                      NODE_W + 2 * _MARGIN, NODE_H + 2 * _MARGIN)
+        margin = max(_MARGIN, _SHADOW_MARGIN)
+        return QRectF(-margin, -margin,
+                      NODE_W + 2 * margin, NODE_H + 2 * margin)
+
+    def scene_content_rect(self) -> QRectF:
+        """节点卡片场景范围；供 sceneRect 使用，排除阴影绘制边距。"""
+        return QRectF(self.scenePos().x(), self.scenePos().y(), NODE_W, NODE_H)
 
     def in_port_pos(self) -> QPointF:
         """输入端口（左缘中点）场景坐标。"""
@@ -268,15 +280,18 @@ class FlowNodeItem(QGraphicsItem):
     # ── 交互 ──
 
     def _hit_output_port(self, local: QPointF) -> bool:
+        local = QPointF(local)
         c = QPointF(NODE_W, NODE_H / 2.0)
         return (local - c).manhattanLength() <= 16
 
     def _hit_input_port(self, local: QPointF) -> bool:
         """输入端口（左缘中点）命中：按下即反向发起拖线。"""
+        local = QPointF(local)
         c = QPointF(0.0, NODE_H / 2.0)
         return (local - c).manhattanLength() <= 16
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
+        result = super().itemChange(change, value)
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
             self._moved = True
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -286,7 +301,23 @@ class FlowNodeItem(QGraphicsItem):
                 scene.sync_wires_for_node(self.node.node_id)
             self.node.x = self.pos().x()
             self.node.y = self.pos().y()
-        return super().itemChange(change, value)
+        elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            scene = self.scene()
+            if scene is not None and hasattr(scene, "update_incident_wire_highlights"):
+                scene.update_incident_wire_highlights()
+        return result
+
+    def hoverEnterEvent(self, event):
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "set_node_hovered"):
+            scene.set_node_hovered(self.node.node_id, True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "set_node_hovered"):
+            scene.set_node_hovered(self.node.node_id, False)
+        super().hoverLeaveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -362,21 +393,35 @@ class FlowNodeItem(QGraphicsItem):
         style = STYLE.get(self.node.kind, STYLE[KIND_MATCH])
         accent = style["accent"]
 
-        # 卡片主体
+        # 卡片主体（先画两层轻微偏移阴影，再由卡片覆盖中心）
         card = QRectF(0.0, 0.0, NODE_W, NODE_H)
+        shadow_soft = card.translated(_SHADOW_OFFSET, _SHADOW_OFFSET).adjusted(
+            -2.0, -2.0, 2.0, 2.0)
+        shadow_core = card.translated(_SHADOW_OFFSET, _SHADOW_OFFSET)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_SHADOW_SOFT_COLOR)
+        painter.drawRoundedRect(shadow_soft, _RADIUS + 2.0, _RADIUS + 2.0)
+        painter.setBrush(_SHADOW_COLOR)
+        painter.drawRoundedRect(shadow_core, _RADIUS, _RADIUS)
+
         path = QPainterPath()
         path.addRoundedRect(card, _RADIUS, _RADIUS)
         painter.setPen(QPen(_BORDER, 1))
         painter.setBrush(_WHITE)
         painter.drawPath(path)
 
-        # 色带头（裁到圆角内）
+        # 标题栏：类型色浅→本色的垂直渐变，并裁到圆角内
         painter.save()
         painter.setClipPath(path)
         header = QRectF(0.0, 0.0, NODE_W, HEADER_H)
+        gradient = QLinearGradient(header.topLeft(), header.bottomLeft())
+        gradient.setColorAt(0.0, accent.lighter(115))
+        gradient.setColorAt(1.0, accent)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(accent)
+        painter.setBrush(gradient)
         painter.drawRect(header)
+        painter.setPen(QPen(accent.darker(120), 1))
+        painter.drawLine(QPointF(0.0, HEADER_H), QPointF(NODE_W, HEADER_H))
         kind_label = KIND_LABELS.get(self.node.kind, self.node.kind)
         painter.setFont(self._font(12, bold=True))
         painter.setPen(_WHITE)
@@ -430,19 +475,19 @@ class FlowNodeItem(QGraphicsItem):
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                              self._badge_text)
 
-        # 连线悬停合法目标高亮：命中侧端口 + 卡片描绿边（合法目标统一用绿色描边）
+        # 连线悬停合法目标高亮：命中侧端口 + 卡片描绿边
         if self._link_target_in or self._link_target_out:
             painter.setPen(QPen(_GREEN, 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(card.adjusted(1, 1, -1, -1), _RADIUS, _RADIUS)
 
-        # 选中描边
+        # 选中描边：沿用类型色并提亮
         if self.isSelected():
-            painter.setPen(QPen(QColor("#409eff"), 2))
+            painter.setPen(QPen(accent.lighter(130), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(card.adjusted(1, 1, -1, -1), _RADIUS, _RADIUS)
 
-        # 端口（左=输入：悬停「输入侧」合法目标/反向拖线源高亮；右=输出：悬停「输出侧」合法目标/正向拖线源高亮）
+        # 端口（左=输入；右=输出）
         self._draw_port(painter, QPointF(0.0, NODE_H / 2.0), accent,
                         self._link_target_in or self._link_input)
         self._draw_port(painter, QPointF(NODE_W, NODE_H / 2.0), accent,
@@ -472,25 +517,30 @@ class FlowNodeItem(QGraphicsItem):
 
 
 class FlowWireItem(QGraphicsItem):
-    """贝塞尔连线：源模块输出 → 匹配模块输入 / 匹配模块输出 → 支付模块输入。
+    """贝塞尔连线：起点模块类型色、hover/incident 高亮。
 
-    - shape() 加宽命中（约 12px），便于点击/右键选中删除
-    - hover/选中高亮加粗变色
-    - 也可作为「临时橡皮筋线」使用（temp=True，终点随鼠标更新）
+    - shape() 加宽命中，便于点击/右键删除
+    - hover/incident 为 4px 亮化，选中为 4px lighter(150)
+    - 也可作为临时橡皮筋线（temp=True）
     """
 
     _HIT_WIDTH = 12.0
 
     def __init__(self, wire: Optional[FlowWire] = None, temp: bool = False,
-                 parent: Optional[QGraphicsItem] = None):
+                 parent: Optional[QGraphicsItem] = None,
+                 source_color: Optional[QColor] = None):
         super().__init__(parent)
-        self.wire = wire              # 正式连线；temp 线为 None
+        self.wire = wire
         self._temp = temp
         self._p0 = QPointF()
         self._p3 = QPointF()
         self._hover = False
         self._selected = False
+        self._incident_highlight = False
         self._invalid = False
+        fallback = _WIRE_TEMP if temp else _WIRE_COLOR
+        self._base_color = QColor(source_color) if source_color is not None \
+            else QColor(fallback)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton
                                      | Qt.MouseButton.RightButton)
         self.setAcceptHoverEvents(True)
@@ -510,6 +560,20 @@ class FlowWireItem(QGraphicsItem):
     def set_invalid(self, invalid: bool):
         self._invalid = invalid
         self.update()
+
+    @property
+    def base_color(self) -> QColor:
+        """连线基础色（起点模块类型色）的副本。"""
+        return QColor(self._base_color)
+
+    @property
+    def is_incident_highlighted(self) -> bool:
+        return self._incident_highlight
+
+    def set_incident_highlight(self, highlighted: bool):
+        if self._incident_highlight != highlighted:
+            self._incident_highlight = highlighted
+            self.update()
 
     def boundingRect(self) -> QRectF:
         hw = self._HIT_WIDTH
@@ -548,13 +612,11 @@ class FlowWireItem(QGraphicsItem):
 
     def contextMenuEvent(self, event):
         scene = self.scene()
-        # 连线拖拽中右键（临时线/正式线/节点体上的线）：一律先取消连线
         if scene is not None and hasattr(scene, "is_linking") and scene.is_linking():
             scene.cancel_link()
             event.accept()
             return
         if self.wire is None:
-            # 临时橡皮筋线：右键 = 取消连线（不弹菜单）
             if scene is not None and hasattr(scene, "cancel_link"):
                 scene.cancel_link()
             event.accept()
@@ -567,19 +629,26 @@ class FlowWireItem(QGraphicsItem):
 
     # ── 绘制 ──
 
+    def current_pen(self) -> QPen:
+        """返回当前状态的线条笔，供绘制与属性断言复用。"""
+        if self._temp:
+            color = _WIRE_INVALID if self._invalid else self._base_color
+            pen = QPen(color, _WIRE_WIDTH)
+            pen.setStyle(Qt.PenStyle.DashLine)
+        elif self._selected:
+            return QPen(self._base_color.lighter(_WIRE_SELECTED_LIGHTEN),
+                        _WIRE_HIGHLIGHT_WIDTH)
+        elif self._hover or self._incident_highlight:
+            return QPen(self._base_color.lighter(_WIRE_HOVER_LIGHTEN),
+                        _WIRE_HIGHLIGHT_WIDTH)
+        else:
+            return QPen(self._base_color, _WIRE_WIDTH)
+        return pen
+
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem,
               widget: Optional[QWidget] = None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        if self._temp:
-            color = _WIRE_INVALID if self._invalid else _WIRE_TEMP
-            pen = QPen(color, _WIRE_WIDTH)
-            pen.setStyle(Qt.PenStyle.DashLine)
-        else:
-            if self._hover or self._selected:
-                pen = QPen(_WIRE_HOVER, _WIRE_WIDTH + 0.8)
-            else:
-                pen = QPen(_WIRE_COLOR, _WIRE_WIDTH)
-        painter.setPen(pen)
+        painter.setPen(self.current_pen())
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(self._build_path())
 

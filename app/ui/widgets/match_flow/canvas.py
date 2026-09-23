@@ -4,7 +4,7 @@
 职责：
     - FlowScene：节点/连线/临时线的生命周期与 linking 状态机、命中与删除、右键菜单、
       store 注入与派生显示刷新（绑定摘要 / 匹配接入 / 金额）
-    - FlowCanvas：空白平移、Ctrl+滚轮缩放、侧边栏拖放接收、删除键、空态引导浮层
+    - FlowCanvas：框选/中右键平移、直接滚轮缩放、拖放接收、删除键、空态引导。
 
 v2 保留基建：viewportEvent 源头截获拖放、级联删除、平移缩放、空态引导卡片。
 """
@@ -17,7 +17,6 @@ from PySide6.QtGui import (
     QColor,
     QPainter,
     QPen,
-    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QGraphicsScene,
@@ -26,7 +25,9 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
+from .canvas_interaction import FlowInteractionMixin, _FlowViewStyle
 from .items import (
+    STYLE,
     FlowNodeItem,
     FlowWireItem,
     NODE_H,
@@ -48,7 +49,10 @@ _SIDE_OUT = "out"
 _SIDE_MID = "mid"
 _MID_BAND = 6.0      # 模块中线两侧窄带判为「中部」（意图不明 → 无效）
 
-_GRID_COLOR = QColor("#e3e7ee")
+_GRID_MINOR_COLOR = QColor("#edf0f5")
+_GRID_MAJOR_COLOR = QColor("#e3e7ee")
+_GRID_MINOR_STEP = 6
+_GRID_MAJOR_STEP = 24
 _BG_COLOR = QColor("#f5f7fa")
 
 # 空态引导卡片：最大宽度与 rich text 内容（v2 语义，模块说明中性描述）
@@ -97,6 +101,7 @@ class FlowScene(QGraphicsScene):
         self._temp_wire: Optional[FlowWireItem] = None
         self._hover_target_id: Optional[str] = None
         self._hover_side: Optional[str] = None   # 悬停目标命中的端口侧（in/out）
+        self._hover_node_ids: set[str] = set()   # 当前悬停节点集合
         self._selected_wire_id: Optional[str] = None
         self._scene_rect_set = False   # 场景矩形是否已显式设置（_expand 首次留白判定）
 
@@ -164,7 +169,8 @@ class FlowScene(QGraphicsScene):
         负向漂移，节点被甩到视口外。Qt 未显式设置时会自动按 item 计算 sceneRect
         （width>0），无法用空矩形判定“首次”，故用内部标志保证只留白一次。
         """
-        item_r = item.boundingRect().translated(item.pos())
+        item_r = item.scene_content_rect() if hasattr(
+            item, "scene_content_rect") else item.boundingRect().translated(item.pos())
         if not self._scene_rect_set:
             # 仅首次：以首节点为中心外扩留白
             self.setSceneRect(item_r.adjusted(-120.0, -120.0, 120.0, 120.0))
@@ -196,7 +202,9 @@ class FlowScene(QGraphicsScene):
             src_item._link_input = True
         else:
             src_item._link_source = True
-        self._temp_wire = FlowWireItem(temp=True)
+        source_style = STYLE.get(src_item.node.kind, STYLE[KIND_MATCH])
+        self._temp_wire = FlowWireItem(
+            temp=True, source_color=source_style["accent"])
         self.addItem(self._temp_wire)
         p0 = (src_item.in_port_pos() if from_input
               else src_item.out_port_pos())
@@ -359,6 +367,30 @@ class FlowScene(QGraphicsScene):
             item._link_target_out = side == _SIDE_OUT
             item.update()
 
+    def set_node_hovered(self, node_id: str, hovered: bool):
+        """记录节点悬停并刷新关联连线高亮。"""
+        if hovered:
+            self._hover_node_ids.add(node_id)
+        else:
+            self._hover_node_ids.discard(node_id)
+        self.update_incident_wire_highlights()
+
+    def update_incident_wire_highlights(self):
+        """选中或悬停节点时，其 incident 连线同步高亮。"""
+        for wire in self.model.wires:
+            item = self._wire_items.get(wire.wire_id)
+            if item is None:
+                continue
+            src = self.node_item(wire.src_id)
+            dst = self.node_item(wire.dst_id)
+            active = (
+                wire.src_id in self._hover_node_ids
+                or wire.dst_id in self._hover_node_ids
+                or (src is not None and src.isSelected())
+                or (dst is not None and dst.isSelected())
+            )
+            item.set_incident_highlight(active)
+
     def _top_node_at(self, scene_pos: QPointF) -> Optional[FlowNodeItem]:
         for it in self.items(scene_pos):
             if isinstance(it, FlowNodeItem):
@@ -381,10 +413,12 @@ class FlowScene(QGraphicsScene):
         dst_item = self.node_item(wire.dst_id)
         if src_item is None or dst_item is None:
             return
-        item = FlowWireItem(wire=wire)
+        source_style = STYLE.get(src_item.node.kind, STYLE[KIND_MATCH])
+        item = FlowWireItem(wire=wire, source_color=source_style["accent"])
         item.set_endpoints(src_item.out_port_pos(), dst_item.in_port_pos())
         self.addItem(item)
         self._wire_items[wire.wire_id] = item
+        self.update_incident_wire_highlights()
 
     def _refresh_affected_matches(self, wire):
         """连线增删后刷新涉及的匹配模块（发票侧 dst 或匹配侧 src）。"""
@@ -404,6 +438,7 @@ class FlowScene(QGraphicsScene):
         if self._selected_wire_id == wire_id:
             self._selected_wire_id = None
         self._refresh_affected_matches(wire)
+        self.update_incident_wire_highlights()
         if not silent:
             self._status("已删除连线", True)
 
@@ -439,6 +474,7 @@ class FlowScene(QGraphicsScene):
         })
         self.model.remove_node(node_id)
         self.remove_node_item(node_id)
+        self._hover_node_ids.discard(node_id)
         for w in wires:
             item = self._wire_items.pop(w.wire_id, None)
             if item is not None:
@@ -448,6 +484,7 @@ class FlowScene(QGraphicsScene):
             self._selected_wire_id = None
         for m_id in affected:
             self.refresh_match_summary(m_id)
+        self.update_incident_wire_highlights()
         self.nodesChanged.emit()
         self._status(f"已删除模块：{self._node_name(node_id)}", True)
 
@@ -519,7 +556,21 @@ class FlowScene(QGraphicsScene):
         if picked is act_delete:
             self.delete_wire(wire_id)
 
-    # ── 工具 ──
+    def request_canvas_menu(self, screen_pos):
+        """空白画布菜单：保留等效的框选后操作入口。"""
+        menu = QMenu()
+        act_select_all = menu.addAction("全选")
+        act_clear = menu.addAction("清除选择")
+        picked = menu.exec(screen_pos)
+        if picked is act_select_all:
+            self.clear_wire_selection()
+            for item in self._node_items.values():
+                item.setSelected(True)
+            self.update_incident_wire_highlights()
+        elif picked is act_clear:
+            self.clearSelection()
+            self.clear_wire_selection()
+            self.update_incident_wire_highlights()
 
     def _node_name(self, node_id: str) -> str:
         node = self.model.get_node(node_id)
@@ -545,25 +596,35 @@ class FlowScene(QGraphicsScene):
         super().contextMenuEvent(event)
 
     def drawBackground(self, painter: QPainter, rect):
-        """浅底 + 点阵网格（Node-RED 质感但保持轻盈）。"""
+        """浅底 + 6px 细点与 24px 主点双层网格。"""
         painter.fillRect(rect, _BG_COLOR)
-        painter.setPen(QPen(_GRID_COLOR, 1))
-        left = int(rect.left()) - (int(rect.left()) % 24)
-        top = int(rect.top()) - (int(rect.top()) % 24)
-        x = left
+        minor_left = int(rect.left()) - (int(rect.left()) % _GRID_MINOR_STEP)
+        minor_top = int(rect.top()) - (int(rect.top()) % _GRID_MINOR_STEP)
+        major_left = int(rect.left()) - (int(rect.left()) % _GRID_MAJOR_STEP)
+        major_top = int(rect.top()) - (int(rect.top()) % _GRID_MAJOR_STEP)
+
+        painter.setPen(QPen(_GRID_MINOR_COLOR, 1))
+        x = minor_left
         while x < rect.right():
-            y = top
+            y = minor_top
+            while y < rect.bottom():
+                if x % _GRID_MAJOR_STEP or y % _GRID_MAJOR_STEP:
+                    painter.drawPoint(x, y)
+                y += _GRID_MINOR_STEP
+            x += _GRID_MINOR_STEP
+
+        painter.setPen(QPen(_GRID_MAJOR_COLOR, 1))
+        x = major_left
+        while x < rect.right():
+            y = major_top
             while y < rect.bottom():
                 painter.drawPoint(x, y)
-                y += 24
-            x += 24
+                y += _GRID_MAJOR_STEP
+            x += _GRID_MAJOR_STEP
 
 
-class FlowCanvas(QGraphicsView):
-    """画布视图：空白平移 + Ctrl 滚轮缩放 + 拖放接收 + 删除键 + 空态引导。"""
-
-    _MIN_ZOOM = 0.4
-    _MAX_ZOOM = 2.5
+class FlowCanvas(FlowInteractionMixin, QGraphicsView):
+    """画布视图：框选/中右键平移 + 直接滚轮缩放 + 拖放接收 + 删除键 + 空态引导。"""
 
     def __init__(self, model: FlowModel, parent=None):
         super().__init__(parent)
@@ -574,7 +635,7 @@ class FlowCanvas(QGraphicsView):
         self._scene.nodesChanged.connect(self.update_guide)
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -590,12 +651,16 @@ class FlowCanvas(QGraphicsView):
                 border-radius: 6px;
             }
         """)
+        self._rubber_band_style = _FlowViewStyle()
+        self.setStyle(self._rubber_band_style)
 
         self.on_config_requested = None      # dialog 注入：fn(node_id)
         self.on_status = None                # dialog 注入：fn(msg, ok)
         self.on_module_added = None          # dialog 注入：fn(node)
 
         self._panning = False
+        self._pan_button = None
+        self._pan_press = None
         self._pan_last = None
         self._zoom = 1.0
 
@@ -675,73 +740,6 @@ class FlowCanvas(QGraphicsView):
             self._guide.hide()
 
     # ── 视图事件：平移 / 缩放 / 键盘 / 拖放 ──
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton \
-                and self.itemAt(event.position().toPoint()) is None \
-                and not self._scene.is_linking():
-            self._panning = True
-            self._pan_last = event.position()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            self._scene.clear_wire_selection()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._panning and self._pan_last is not None:
-            delta = event.position() - self._pan_last
-            self._pan_last = event.position()
-            hbar = self.horizontalScrollBar()
-            vbar = self.verticalScrollBar()
-            hbar.setValue(hbar.value() - int(delta.x()))
-            vbar.setValue(vbar.value() - int(delta.y()))
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self._panning:
-            self._panning = False
-            self._pan_last = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def wheelEvent(self, event: QWheelEvent):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            angle = event.angleDelta().y()
-            factor = 1.15 if angle > 0 else 1 / 1.15
-            new_zoom = self._zoom * factor
-            new_zoom = max(self._MIN_ZOOM, min(self._MAX_ZOOM, new_zoom))
-            factor = new_zoom / self._zoom
-            self.scale(factor, factor)
-            self._zoom = new_zoom
-            event.accept()
-            return
-        super().wheelEvent(event)
-
-    def keyPressEvent(self, event):
-        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            self._scene.delete_selected()
-            event.accept()
-            return
-        if event.key() == Qt.Key.Key_Escape:
-            if self._scene.is_linking():
-                self._scene.cancel_link()
-                event.accept()
-                return
-            super().keyPressEvent(event)
-            return
-        super().keyPressEvent(event)
-
-    def focusOutEvent(self, event):
-        # 失焦清 linking 态，防悬空临时线
-        self._scene.cancel_link()
-        super().focusOutEvent(event)
-
-    # ── 拖放接收：viewportEvent 源头截获（所有投递到 viewport 的 drag/drop 必经）──
 
     def _accept_node_drag(self, event) -> bool:
         """模块 mime 命中则接受 enter/move/drop 事件；Drop 时落点生成节点。"""
