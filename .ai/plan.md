@@ -536,3 +536,18 @@ def _on_confirm():
   匹配 172/7608），选中行仍含类型主色；截图 `_tmp_diag/palette_colored.png`。
 - 问题3：min size 保留、show 后 isMaximized=True（可用屏覆盖断言通过）、布局不崩、远端节点可滚动。
 - `bash scripts/check.sh` 全绿。临时脚本已清理；`_tmp_diag/` 截图留 Claude 审后删。
+
+---
+
+## 2026-09-23 实现：PyFlowGraph 交互与视觉范式
+
+- `canvas_interaction.py`：抽出平移/缩放/右键路由与橡皮筋样式，使 `canvas.py` 保持 <800 行。
+- `canvas.py`：左键空白交给 `QGraphicsView.RubberBandDrag`，用局部 `QProxyStyle` 绘制蓝色半透
+  虚线框；中键/右键 press+move 超过 3px 才平移（ClosedHand），右键轻点在 release 按命中项
+  路由节点/连线/画布菜单；滚轮无修饰直接按 1.15 缩放并钳制 0.4~2.5。
+- `canvas.py`：场景维护节点悬停集合，并在节点选择/悬停/连线增删时刷新 incident 连线高亮；
+  正式连线创建时把起点 `items.STYLE[kind]["accent"]` 注入 `FlowWireItem`；双 6/24 点阵网格。
+- `items.py`：节点标题栏改类型色垂直渐变 + darker(120) 分隔线，阴影绘制边距与
+  `scene_content_rect()` 解耦以避免污染 `sceneRect`；选中描边改类型色 lighter(130)。
+  连线默认 3px 类型色，hover/incident 4px 亮化，选中 4px lighter(150)。
+- 保留端口级双向拖线、自动铺、confirm、联动删除和现有 model/store 语义；不触碰用户数据。

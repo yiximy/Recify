@@ -72,3 +72,24 @@
 - 双保险：展示层过滤（config 候选/自动铺反查只接受 ≥1 非 missing 成员，部分缺失标注）+ store merge 后 _prune_shell_combos（全 missing 组合自动清理，部分缺失保留）
 - 取舍记录：mark_missing=True（文件夹替换语义）重扫后旧文件夹组合成员全 missing → 自动删组合；文件切回可恢复但组合丢失（仅删全 missing、展示层过滤是第一道保险；若不可接受可移除两处 _prune 调用退回纯展示过滤）
 - 独立抽查：全 missing 组合被 prune、部分缺失组合保留；存量 3 个空壳组合按要求不主动清（树中可删/未来重扫自然清理），展示层已不再暴露
+
+## PyFlowGraph 范式改造审查结论（2026-09-23 追加）
+
+**结论：通过 ✅**（依用户既定规则直接提交推送）
+
+### 背景
+人类指定参考 PyFlowGraph（MIT, bhowiebkr）重构画布**交互与视觉**。Claude 尽调其源码后定规格（不整包引入其 13.4k 行应用与 markdown-it-py 依赖）：对齐交互范式（左键框选/中键右键平移/右键轻点菜单/滚轮直接缩放）+ 核心视觉（连线=起点类型色 3px/选中悬停高亮/节点渐变标题栏+阴影/双层网格）。人类拍板跟随其交互范式。
+
+### 实现
+- 新增 `canvas_interaction.py`（FlowInteractionMixin + _FlowViewStyle 橡皮筋样式，右键 press/move/release 三段状态机，3px 阈值区分菜单与平移；Mixin 使 canvas.py 保持 796 行 < 800 约束）
+- `canvas.py`：RubberBandDrag、incident 高亮、sceneContentRect 防阴影污染场景矩形、空白画布菜单（全选/清除选择）
+- `items.py`：连线类型色（取自 STYLE 唯一色源）、3px/悬停 4px 亮化/选中 lighter(150)、节点渐变标题栏 + darker(120) 分隔线 + 双绘微阴影、选中描边类型色 lighter(130)
+
+### 验证（Codex 46/46 + Claude 独立抽查）
+- 独立抽查：RubberBandDrag ✓、多选 ✓、滚轮缩放 1.0→1.15 ✓、连线色（发票 #409eff / 匹配 #e6a23c）✓、菜单路由（节点区/空白区）✓、confirm 回归 2/2 ✓
+- Codex：框选整体移动/批量删除、右键拖平移、三类菜单路由、缩放钳制、端口双向拖线四路径、自动铺 1+1+N、场景矩形不漂移、渲染像素（阴影/渐变/双层网格/连线色），check.sh 全绿
+- 明确未做（防蔓延）：reroute 节点/分组容器/撤销重做/dark theme
+
+### 遗留
+- 空白画布菜单新增「全选/清除选择」文案待人类真机确认
+- 真机手感复验（框选/右键平移/滚轮缩放/连线观感）
