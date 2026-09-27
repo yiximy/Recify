@@ -551,3 +551,13 @@ def _on_confirm():
   `scene_content_rect()` 解耦以避免污染 `sceneRect`；选中描边改类型色 lighter(130)。
   连线默认 3px 类型色，hover/incident 4px 亮化，选中 4px lighter(150)。
 - 保留端口级双向拖线、自动铺、confirm、联动删除和现有 model/store 语义；不触碰用户数据。
+
+---
+
+## 2026-09-27 实现方案：画布模块文件预览右侧面板
+
+- 主改造 `app/ui/widgets/match_flow_dialog.py`，并将面板封装为新增 `app/ui/widgets/match_flow/preview_panel.py`；不改 `model.py`、store、自动铺、执行管线和配置弹窗。
+- 对话框主体在模块库与画布之后增加固定 420px 的 `PreviewView` 面板：标题行显示模块名和类型色标签；列表展开源模块绑定文件或匹配链发票/支付侧分组；折叠后隐藏面板，仅在右缘保留窄「展开」入口，画布凭 stretch 自适应。
+- 选中联动优先直接连接 `FlowCanvas.flow_scene.selectionChanged`，dialog 只统计 `FlowNodeItem`：0 个显示占位，1 个按发票/支付/匹配规则构建列表，>1 个显示多选提示；节点配置或数据刷新后重算。
+- 源模块列表保留直接绑定与组合成员顺序并去重，组合成员显示来源组合名；匹配模块按入线发票侧、出线支付侧分组。文件对象 `missing` 或绝对路径不存在时置灰且不可选中，预览默认选第一项可读文件。
+- 验证使用 offscreen 临时脚本构造真实 dialog/store 场景，断言列表内容、预览源路径与标题、缺失态、折叠尺寸、PDF/PNG 渲染；再跑端口拖线、框选、自动铺/confirm 和 `scripts/check.sh` 回归。仅保留 2 张 `_tmp_diag/` 截图，脚本用后删除。
