@@ -98,6 +98,16 @@ class PreviewView(QWidget):
         self.graphics_view.set_pixmap(pixmap)
         self.fit_in_view()
 
+    def set_title(self, title: str):
+        """设置预览区标题文字。"""
+        self._title = title
+        self.lbl_title.setText(title)
+
+    @property
+    def has_content(self) -> bool:
+        """当前是否已加载可显示内容（图片或 PDF 渲染页）。"""
+        return self._pixmap is not None and not self._pixmap.isNull()
+
     def set_pdf(self, pdf_path: str, page_idx: int = 0):
         """设置 PDF 文件并渲染指定页。"""
         from app.core.pdf_renderer import PdfRenderer

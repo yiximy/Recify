@@ -35,7 +35,12 @@ from monkeyqt import MkButton, MkMessage
 
 from app.ui.widgets.match_flow.canvas import FlowCanvas, MIME_NODE
 from app.ui.widgets.match_flow.config_dialog import NodeConfigDialog
-from app.ui.widgets.match_flow.items import NODE_H, NODE_W, STYLE as NODE_STYLE
+from app.ui.widgets.match_flow.items import (
+    FlowNodeItem,
+    NODE_H,
+    NODE_W,
+    STYLE as NODE_STYLE,
+)
 from app.ui.widgets.match_flow.model import (
     FlowModel,
     KIND_INVOICE,
@@ -43,6 +48,7 @@ from app.ui.widgets.match_flow.model import (
     KIND_MATCH,
     KIND_PAYMENT,
 )
+from app.ui.widgets.match_flow.preview_panel import MatchFlowPreviewPanel
 
 _PALETTE_ITEMS = [
     (KIND_INVOICE, "电子发票", "绑定发票文件/组合"),
@@ -260,6 +266,7 @@ class MatchFlowDialog(QDialog):
         self.result_summary: Optional[dict] = None
         self.model = FlowModel()
         self._status_text = ""
+        self._preview_collapsed = False
 
         self.setWindowTitle("自动比对 · 流程画布")
         self.setModal(True)
@@ -328,6 +335,17 @@ class MatchFlowDialog(QDialog):
         body.addWidget(self._build_palette(), stretch=0)
         self.canvas = FlowCanvas(self.model)
         body.addWidget(self.canvas, stretch=1)
+        self.preview_panel = MatchFlowPreviewPanel(
+            store=self.store, parent=self)
+        body.addWidget(self.preview_panel, stretch=0)
+
+        self.btn_preview_expand = MkButton("展开", type="default")
+        self.btn_preview_expand.setObjectName("previewExpandButton")
+        self.btn_preview_expand.setAutoDefault(False)
+        self.btn_preview_expand.setFixedWidth(38)
+        self.btn_preview_expand.setToolTip("展开文件预览面板")
+        self.btn_preview_expand.hide()
+        body.addWidget(self.btn_preview_expand, stretch=0)
         layout.addLayout(body, stretch=1)
 
         # 底部状态 + 按钮
@@ -374,6 +392,29 @@ class MatchFlowDialog(QDialog):
         self.canvas.on_config_requested = self._open_config
         self.canvas.on_status = self._show_status
         self.canvas.on_module_added = self._on_module_added
+        self.canvas.flow_scene.selectionChanged.connect(
+            self._on_node_selection_changed)
+        self.preview_panel.collapseRequested.connect(
+            lambda: self._set_preview_collapsed(True))
+        self.btn_preview_expand.clicked.connect(
+            lambda: self._set_preview_collapsed(False))
+        self._on_node_selection_changed()
+
+    def _on_node_selection_changed(self) -> None:
+        """画布节点选择变化后，把选中节点交给只读预览面板。"""
+        nodes = [
+            item.node for item in self.canvas.flow_scene.selectedItems()
+            if isinstance(item, FlowNodeItem)
+        ]
+        self.preview_panel.set_selection(nodes, self.model)
+
+    def _set_preview_collapsed(self, collapsed: bool) -> None:
+        """折叠仅修改本次会话控件可见性，不写入任何配置。"""
+        if self._preview_collapsed == collapsed:
+            return
+        self._preview_collapsed = collapsed
+        self.preview_panel.setVisible(not collapsed)
+        self.btn_preview_expand.setVisible(collapsed)
 
     # ── 自动铺候选链 ──
 
@@ -531,6 +572,7 @@ class MatchFlowDialog(QDialog):
                                match_summary=summary, usage=usage)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.canvas.flow_scene.refresh_all()
+            self._on_node_selection_changed()
             self._show_status(f"「{node.name}」配置已更新", True)
 
     def _binding_usage(self, exclude_node_id: str) -> dict:
