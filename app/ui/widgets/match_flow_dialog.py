@@ -43,6 +43,7 @@ from app.ui.widgets.match_flow.items import (
     STYLE as NODE_STYLE,
 )
 from app.ui.widgets.match_flow.model import (
+    DEFAULT_PARAMS,
     FlowModel,
     FlowNode,
     KIND_INVOICE,
@@ -262,9 +263,10 @@ class _PaletteList(QListWidget):
 class MatchFlowDialog(QDialog):
     """自动比对流程画布（模态二级界面，v2）。"""
 
-    def __init__(self, store=None, parent=None) -> None:
+    def __init__(self, store=None, parent=None, config=None) -> None:
         super().__init__(parent)
         self.store = store
+        self.config = config
         self.result_summary: Optional[dict] = None
         self.model = FlowModel()
         self._status_text = ""
@@ -420,12 +422,31 @@ class MatchFlowDialog(QDialog):
 
     # ── 自动铺候选链 ──
 
+    def _match_preferences(self) -> dict:
+        """读取匹配模块偏好；无配置时回退到模型默认参数。"""
+        if self.config is None:
+            return dict(DEFAULT_PARAMS)
+        return {
+            "tolerance": round(
+                float(self.config.get("match_amount_tolerance", 0.01)), 2),
+            "time_tolerance_days": int(
+                self.config.get("match_time_tolerance_days", 7)),
+            "time_unlimited": bool(
+                self.config.get("match_time_unlimited", False)),
+        }
+
     def _auto_place(self):
-        """打开时按默认 7 天时间容差铺候选链，不重算引擎。"""
+        """打开时按偏好容差铺候选链，不重算引擎。"""
         if self.store is None:
             return
+        prefs = self._match_preferences()
+        time_tolerance = None if prefs["time_unlimited"] \
+            else prefs["time_tolerance_days"]
         try:
-            matches = self.store.get_amount_matches(time_tolerance_days=7)
+            matches = self.store.get_amount_matches(
+                tolerance=prefs["tolerance"],
+                time_tolerance_days=time_tolerance,
+            )
         except Exception:
             matches = []
             self._show_status(
@@ -518,6 +539,7 @@ class MatchFlowDialog(QDialog):
 
     def _make_match_node(self, amount: float):
         node = self.model.add_node(KIND_MATCH, 0.0, 0.0)
+        node.params.update(self._match_preferences())
         node.name = f"匹配 ¥{amount:,.2f}"
         return node
 
@@ -554,6 +576,9 @@ class MatchFlowDialog(QDialog):
     # ── 交互回调 ──
 
     def _on_module_added(self, node):
+        if node.kind == KIND_MATCH:
+            node.params.update(self._match_preferences())
+            self.canvas.flow_scene.refresh_match_summary(node.node_id)
         self._show_status(
             f"已添加模块「{node.name}」：双击绑定文件/组合或配置参数", True)
 
@@ -571,7 +596,7 @@ class MatchFlowDialog(QDialog):
                 summary += f"；当前链金额 ¥{amount:,.2f}"
         else:
             usage = self._binding_usage(exclude_node_id=node_id)
-        dlg = NodeConfigDialog(node, self.store, parent=self,
+        dlg = NodeConfigDialog(node, self.store, config=self.config, parent=self,
                                match_summary=summary, usage=usage)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.canvas.flow_scene.refresh_all()

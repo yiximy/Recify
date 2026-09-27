@@ -96,7 +96,7 @@ class MainWindow(MkWindow):
         self.page_home = HomePage(store=self.store)
         self.page_home.setObjectName("home")
 
-        self.page_compare = ComparePage(store=self.store)
+        self.page_compare = ComparePage(store=self.store, config=self.config)
         self.page_compare.setObjectName("compare")
 
         self.page_amount = AmountPage(store=self.store)

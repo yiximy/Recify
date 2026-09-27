@@ -16,6 +16,9 @@ class AppConfig:
         "theme": "Elegant Light",
         "last_menu": "home",
         "window_geometry": "",  # QByteArray base64 字符串
+        "match_time_tolerance_days": 7,
+        "match_time_unlimited": False,
+        "match_amount_tolerance": 0.01,
     }
 
     def __init__(self, path: str):

@@ -34,6 +34,8 @@ LOW_CONFIDENCE = 0.8
 # 表格行高下限：确保编辑输入框完整显示，不被截断（实际按输入框高度自适应）
 ROW_HEIGHT = 46
 
+# 日期列宽：容纳 YYYY-MM-DD 或占位符
+DATE_COL_WIDTH = 110
 # 编辑金额列宽：足以完整显示较大金额（含 "99999999.99" 级别）
 EDIT_COL_WIDTH = 180
 # 确认列宽：仅放一个居中复选框
@@ -246,7 +248,7 @@ class AmountPage(QWidget):
 
         # 文件列表表格
         self.table = MkTable()
-        self.table.set_headers(["文件名", "识别金额", "编辑金额", "确认"])
+        self.table.set_headers(["文件名", "日期", "识别金额", "编辑金额", "确认"])
         enable_smooth_scroll(self.table)
         self.table.setMinimumHeight(TABLE_MIN_HEIGHT)
         self._configure_columns()
@@ -311,16 +313,18 @@ class AmountPage(QWidget):
         content_layout.addLayout(row)
 
     def _configure_columns(self):
-        """设定各列尺寸策略。"""
+        """设定各列尺寸策略（文件名 / 日期 / 识别金额 / 编辑金额 / 确认）。"""
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setMinimumSectionSize(70)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
-        self.table.setColumnWidth(2, EDIT_COL_WIDTH)
-        header.setSectionResizeMode(3, QHeaderView.Fixed)
-        self.table.setColumnWidth(3, CONFIRM_COL_WIDTH)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table.setColumnWidth(1, DATE_COL_WIDTH)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        self.table.setColumnWidth(3, EDIT_COL_WIDTH)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        self.table.setColumnWidth(4, CONFIRM_COL_WIDTH)
 
     def showEvent(self, event):
         """首次显示时精确调整左侧分栏比例。"""
@@ -562,7 +566,8 @@ class AmountPage(QWidget):
         for f in self._filtered_files:
             amount = self._get_file_amount(f)
             recognized_text = f"{amount:.2f}" if amount is not None else "—"
-            rows.append([f.file_name, recognized_text, "", ""])
+            date_text, _placeholder = self._get_date_display(f)
+            rows.append([f.file_name, date_text, recognized_text, "", ""])
 
         self.table.set_data(rows)
 
@@ -571,10 +576,11 @@ class AmountPage(QWidget):
             self._fid_to_row[f.file_id] = row_idx
             amount = self._get_file_amount(f)
             confidence = self._get_file_confidence(f)
+            self._set_date_cell(row_idx, f)
 
             # 低置信度标橙
             if amount is not None and confidence < LOW_CONFIDENCE:
-                item = self.table.item(row_idx, 1)
+                item = self.table.item(row_idx, 2)
                 if item:
                     item.setForeground(QColor("#e6a23c"))
 
@@ -582,7 +588,7 @@ class AmountPage(QWidget):
             edit_cell = AmountEditCell(f.file_id, amount)
             edit_cell.committed.connect(self._on_amount_committed)
             self._edit_cells[f.file_id] = edit_cell
-            self.table.setCellWidget(row_idx, 2, edit_cell)
+            self.table.setCellWidget(row_idx, 3, edit_cell)
 
             # 确认复选框
             is_confirmed = self._get_file_is_confirmed(f)
@@ -597,13 +603,43 @@ class AmountPage(QWidget):
             wl.setContentsMargins(0, 0, 0, 0)
             wl.addWidget(check)
             wl.setAlignment(Qt.AlignCenter)
-            self.table.setCellWidget(row_idx, 3, wrap)
+            self.table.setCellWidget(row_idx, 4, wrap)
 
             row_h = max(ROW_HEIGHT, edit_cell.sizeHint().height() + 4)
             self.table.setRowHeight(row_idx, row_h)
 
         self._configure_columns()
         self._suppress = False
+
+    def _get_date_display(self, file) -> tuple[str, bool]:
+        """返回日期显示文本及是否为未识别占位。"""
+        if not self.store:
+            return "—", True
+        date_iso, source = self.store.get_document_date(file)
+        if source == "ocr" and date_iso:
+            return date_iso, False
+        return "—", True
+
+    def _set_date_cell(self, row_idx: int, file) -> None:
+        """按 OCR 日期刷新日期列；未识别保持灰色占位符。"""
+        item = self.table.item(row_idx, 1)
+        if item is None:
+            return
+        text, placeholder = self._get_date_display(file)
+        item.setText(text)
+        item.setToolTip(text)
+        item.setForeground(QColor("#c0c4cc" if placeholder else "#303133"))
+
+    def _refresh_date_cell(self, row_idx: int, file_id: str) -> None:
+        """从 Store 重新读取单文件日期并刷新可见行。"""
+        if not self.store:
+            return
+        if self._file_type == "image":
+            file = self.store.get_payment(file_id)
+        else:
+            file = self.store.get_invoice(file_id)
+        if file is not None:
+            self._set_date_cell(row_idx, file)
 
     @staticmethod
     def _get_file_confidence(f) -> float:
@@ -763,7 +799,8 @@ class AmountPage(QWidget):
 
             # 更新可见行的表格显示
             if row_idx is not None:
-                item = self.table.item(row_idx, 1)
+                self._refresh_date_cell(row_idx, fid)
+                item = self.table.item(row_idx, 2)
                 if item:
                     if recognized is not None:
                         item.setText(f"{recognized:.2f}")
@@ -904,6 +941,7 @@ class AmountPage(QWidget):
                 continue
             amount = self._get_file_amount(f)
             is_confirmed = self._get_file_is_confirmed(f)
+            self._refresh_date_cell(row_idx, f.file_id)
 
             check = self._confirm_checks.get(f.file_id)
             if check and check.isChecked() != is_confirmed:

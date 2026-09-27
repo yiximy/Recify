@@ -61,8 +61,10 @@ def _fmt_amount(amount: Optional[float]) -> str:
 class NodeConfigDialog(QDialog):
     """节点配置弹窗（模态，parent 为流程画布对话框，保证层级正确）。"""
 
-    def __init__(self, node: FlowNode, store, parent: Optional[QWidget] = None,
-                 match_summary: str = "", usage: Optional[dict] = None):
+    def __init__(self, node: FlowNode, store,
+                 parent: Optional[QWidget] = None,
+                 match_summary: str = "", usage: Optional[dict] = None,
+                 config=None):
         """Args:
             node: 被配置的 FlowNode
             store: 候选数据源（get_invoices/get_payments/get_combos/get_combo_total）
@@ -72,6 +74,7 @@ class NodeConfigDialog(QDialog):
         super().__init__(parent)
         self._node = node
         self._store = store
+        self._config = config
         self._kind = node.kind
         self._kind_label = KIND_LABELS.get(self._kind, self._kind)
         self._match_summary = match_summary
@@ -403,4 +406,18 @@ class NodeConfigDialog(QDialog):
                 self.spin_time_tolerance.value()
             self._node.params["time_unlimited"] = \
                 self.check_time_unlimited.isChecked()
+            if self._config is not None:
+                self._config.set(
+                    "match_amount_tolerance",
+                    self._node.params["tolerance"],
+                )
+                self._config.set(
+                    "match_time_tolerance_days",
+                    self._node.params["time_tolerance_days"],
+                )
+                self._config.set(
+                    "match_time_unlimited",
+                    self._node.params["time_unlimited"],
+                )
+                self._config.save()
         super().accept()

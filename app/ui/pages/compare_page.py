@@ -30,9 +30,10 @@ class ComparePage(QWidget):
         └─────────────────────────────────────────┘
     """
 
-    def __init__(self, store=None, parent=None):
+    def __init__(self, store=None, parent=None, config=None):
         super().__init__(parent)
         self.store = store
+        self.config = config
         self._build_ui()
         self._connect_signals()
         self._restore_state()
@@ -207,7 +208,7 @@ class ComparePage(QWidget):
             MkMessage.warning(self, "数据未初始化")
             return
 
-        dialog = MatchFlowDialog(store=self.store, parent=self)
+        dialog = MatchFlowDialog(store=self.store, config=self.config, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
