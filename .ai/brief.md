@@ -1,61 +1,46 @@
-# 任务简报：画布模块文件预览（右侧面板）
+# 任务简报（第 2/2 轮）：时间条件的画布接线（匹配模块参数 + 自动铺 + 执行管线）
 
-## 需求（人类 2026-09-27）
-
-在自动比对画布中，点击发票/支付记录模块即可**查看该模块绑定文件的内容**（发票 PDF / 支付截图），便于人工核对匹配是否正确。
-
-**已拍板**：预览区 = 对话框**右侧固定面板（约 420px，可折叠）**。
+> 第 1 轮已完成并通过审查：`date_parser`、models 字段、store（`set_document_date`/`get_document_date` 回退/`get_amount_matches(time_tolerance_days)` 组合区间语义）、OCR 落库。本轮把时间条件接入画布 UI 与执行链路。
 
 ## 规格
 
-### 1. 面板结构（MatchFlowDialog 布局改造）
+### 1. 匹配模块参数（model + 配置面板）
 
-```
-┌模块库(190)┬────────画布(stretch)────────┬─预览(420, 可折叠)─┐
-│ 电子发票   │                            │ [标题: 模块名]      │
-│ 支付记录   │       节点/连线...          │ [文件列表]         │
-│ 匹配      │                            │ [PreviewView]     │
-└──────────┴────────────────────────────┴───────────────────┘
-```
+- `FlowNode.params` 增加 `time_tolerance_days: int = 7`（默认 7 天）与 `time_unlimited: bool = False`（不限制时间；勾选时忽略天数）
+- 配置面板（`config_dialog.py`）「匹配」模块区域新增：
+  - `时间容差 ≤ N 天`（QSpinBox，0~365，默认 7；0 = 必须同日）
+  - `不限制时间`（QCheckBox；勾选时禁用天数框）
+  - 说明小字：「按票面日期（识别失败回退文件时间）比较两侧最近距离」
+- 节点卡片摘要（`items.py`）增加时间条件显示：`≤7天` / `同日` / `不限时间`
 
-- 顶部标题行：当前模块名 + 类型标注；右侧「折叠/展开」按钮（折叠后画布占满，面板宽度归零隐藏）
-- 中部文件列表（QListWidget，紧凑）：列出当前模块绑定文件（组合模块展开其成员文件，标注来源组合名）；单击列表项切换预览
-- 下部预览区：**复用 `app/ui/widgets/preview_view.py` 的 PreviewView**（已支持 `set_pdf(abs_path)` PDF 翻页/缩放、`set_pixmap` 图片显示），不新写渲染
+### 2. 自动铺带时间条件
 
-### 2. 触发与内容规则（监听画布选中）
+- `match_flow_dialog._build_candidate_chains`：`store.get_amount_matches(time_tolerance_days=7)`（默认值；不改引擎调用以外的行为）
+- 画布无候选时的提示文案补充「（可能因时间条件被排除，可在匹配模块调大容差或选择不限制）」
 
-- **单选发票/支付模块** → 面板显示该模块 `canonical_file_ids(store)` 对应文件（含组合成员），默认选中第一个并预览
-- **单选匹配模块** → 显示该链两侧文件（分组列表：`发票侧` 该模块入线发票模块的文件 + `支付侧` 其出线支付模块的文件），便于核对整条匹配
-- **多选** → 面板提示「已选择 N 个模块，请单选查看文件」
-- **无选中/空白** → 占位提示「点击发票 / 支付模块查看文件内容」
-- **未绑定/文件缺失** → 对应提示（未绑定文件 / 文件缺失），缺失项置灰不可预览
-- 实现方式：`FlowCanvas` 增加 `nodeSelectionChanged = Signal()`（或 dialog 直接 connect `scene.selectionChanged`），dialog 侧计算内容刷新面板；**不改 model/store/自动铺/执行管线**
-- 预览只读，不修改任何数据/绑定
+### 3. 执行管线逐链时间校验
 
-### 3. 折叠
+- `_on_confirm` 逐支线校验除金额差外增加**时间校验**：
+  - 取链发票侧与支付侧绑定文件的日期区间（复用 `store.get_document_date`，组合成员展开取 min/max）
+  - 链有效条件：金额差 ≤ tolerance **且**（time_unlimited 或 区间最近距离 ≤ time_tolerance_days）
+  - 跳过原因区分：`金额差超出容差` / `时间差超出容差（X 天 > N 天）`，汇总进 result_summary.skip_reasons
+- 一键「确定」文案不新增要求，沿用现结构
 
-- 面板折叠按钮：隐藏面板（`setVisible(False)` / 宽度 0），画布 stretch 自适应；状态仅本次会话内存态，不持久化
+### 4. 预览面板日期展示（帮助人工核对）
 
-### 4. 相关文件
+- `preview_panel` 文件列表项附加日期显示：`文件名 · 2026-07-09（票面/文件）`（来源标注见 store 回退返回的 source）
 
-- `app/ui/widgets/match_flow_dialog.py`（主改造：布局加右侧面板 + 选中联动 + 折叠）
-- `app/ui/widgets/match_flow/canvas.py`（选中信号，若需要）
-- 复用：`app/ui/widgets/preview_view.py`、`items.STYLE`（标题类型色）
-- 不改 `app/core/*`、`model.py`、`config_dialog.py`（配置弹窗不动）
+## 验证要求（Codex）
 
-### 5. 验证要求（Codex 必跑）
+1. 离屏真实对话框（临时 store，构造时间相近/超差数据）：
+   - 自动铺：默认 7 天 → 仅时间接近的候选铺出；调 `time_unlimited=True` 后候选变多（重铺或直接断言引擎调用参数）
+   - confirm：时间超差的链跳过且 skip_reasons 含「时间差」；金额差的链原因不变
+   - 配置面板：SpinBox/复选框联动（勾不限制→天数禁用）、保存后 node.params 正确、卡片摘要文案正确
+   - 预览面板列表项含日期与来源标注
+2. 回归：金额条件/组合/端口拖线/框选/confirm 计数；`D:/Using_small_tools/Git/bin/bash.exe scripts/check.sh` 全绿
+3. 离屏脚本退出用 exec 循环或 sys.exit；临时脚本用后清理；不新增依赖、不改用户数据、不 commit
 
-1. 程序化选中（setSelected + processEvents）：
-   - 单选发票模块 → 面板文件列表项数 == 绑定文件数、PreviewView 已加载第一份文件（断言内部当前路径/标题）
-   - 组合模块 → 列表含全部成员且标注组合名
-   - 单选匹配模块 → 两侧分组文件均列出
-   - 多选 → 提示文案；无选中 → 占位文案
-   - 折叠按钮 → 面板隐藏、画布宽度增大；展开恢复
-2. 渲染断言：面板可见时 PreviewView 有图像/PDF 渲染（图片文件用 PNG 假文件验证像素）、色带断言不回归
-3. 回归：端口双向拖线四路径、框选、自动铺 1+1+N、confirm 落库、`D:/Using_small_tools/Git/bin/bash.exe scripts/check.sh` 全绿
-4. 截图 `_tmp_diag/` 留 2 张（选中发票模块预览中 / 折叠状态）供审后删；临时脚本用后清理
+## 备注
 
-### 6. 约束
-
-- 不新增第三方依赖；不改 `data/store.json`、`config/app_config.json`
-- 完成后按既定规则：Claude 审查 → 提交推送
+- store.py 已 904 行（超 800 约束）→ 记 backlog 待专项拆分，本轮不动
+- 本轮完成后与第 1 轮一并提交推送（Claude 审查后）

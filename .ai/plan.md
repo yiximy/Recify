@@ -561,3 +561,24 @@ def _on_confirm():
 - 选中联动优先直接连接 `FlowCanvas.flow_scene.selectionChanged`，dialog 只统计 `FlowNodeItem`：0 个显示占位，1 个按发票/支付/匹配规则构建列表，>1 个显示多选提示；节点配置或数据刷新后重算。
 - 源模块列表保留直接绑定与组合成员顺序并去重，组合成员显示来源组合名；匹配模块按入线发票侧、出线支付侧分组。文件对象 `missing` 或绝对路径不存在时置灰且不可选中，预览默认选第一项可读文件。
 - 验证使用 offscreen 临时脚本构造真实 dialog/store 场景，断言列表内容、预览源路径与标题、缺失态、折叠尺寸、PDF/PNG 渲染；再跑端口拖线、框选、自动铺/confirm 和 `scripts/check.sh` 回归。仅保留 2 张 `_tmp_diag/` 截图，脚本用后删除。
+
+---
+
+## 2026-09-27 实现方案：自动匹配时间条件（第 1 轮 core + 引擎 + OCR 管线）
+
+- 新增 `app/core/date_parser.py`：以标准库 `date/re/unicodedata` 实现纯函数解析；先扫含「开票日期」的行，再按行序扫描通用日期；统一支持中文、四种分隔符/8 位连写，返回前用真实日历校验。
+- `models.py`：在共享 `FileInfo` 增加 `document_date` 与 `document_date_source`，随 `asdict/from_dict` 自然兼容旧数据。
+- `store.py`：新增单文件日期写入口与统一回退函数；`merge_invoices/merge_payments` 按现有金额/关联策略保留旧日期；匹配单元补充 ISO 日期区间，`time_tolerance_days=None` 时完全不增加过滤。
+- `amount_page.py`：在现有回主线程的 `_on_ocr_finished` 路径解析 `raw_texts`，成功则以 `"ocr"` 持久化；解析失败不写日期、不影响金额。
+- 验证：运行 date_parser 自带断言；临时 Store 覆盖 None 回归、N/N+1/组合区间/票面优先/回退/已关联/missing；用伪 OCR 结果调用落库路径；最后运行 `scripts/check.sh`。
+
+---
+
+## 2026-09-27 实现方案：自动匹配时间条件（第 2 轮画布接线）
+
+- model.py：DEFAULT_PARAMS 与文档补充 	ime_tolerance_days=7、	ime_unlimited=False，兼容旧节点缺字段。
+- config_dialog.py：匹配模块增加 0~365 天 QSpinBox、不限制时间 QCheckBox（联动禁用）与日期语义说明；确定时回写两个 params。
+- items.py：匹配卡片与 tooltip 统一显示 ≤N天 / 同日 / 不限时间。
+- match_flow_dialog.py：自动铺固定调用 get_amount_matches(time_tolerance_days=7) 并补充空态说明；confirm 逐支线按绑定成员日期 min/max 计算区间最近距离，金额通过后再校验时间并区分跳过原因。
+- preview_panel.py：列表项按 Store.get_document_date 返回日期/来源，显示 文件名 · YYYY-MM-DD（票面/文件）。
+- 验证：离屏临时 Store/真实对话框覆盖自动铺 7 天与不限时间、配置联动/params/摘要、confirm 金额/时间跳过、预览日期来源；清理临时脚本后运行现有回归与 scripts/check.sh。
