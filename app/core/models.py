@@ -28,6 +28,10 @@ class FileInfo:
     ext: str
     missing: bool = False
 
+    # 票面日期（ISO 日期）；OCR 失败时由 Store 统一回退文件修改时间
+    document_date: str = ""
+    document_date_source: str = ""       # "ocr" | "file" | ""
+
     def to_dict(self) -> dict:
         return asdict(self)
 

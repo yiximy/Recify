@@ -18,12 +18,13 @@ from PySide6.QtWidgets import (
 )
 from monkeyqt import MkButton, MkTable, MkCard, MkProgressBar, MkMessage, MkInput
 
-from app.ui.widgets.folder_picker import FolderPicker
+from app.core.date_parser import parse_date_from_lines
+from app.core.file_scanner import FileScanner
 from app.ui.widgets.amount_edit_cell import AmountEditCell
 from app.ui.widgets.confirm_checkbox import ConfirmCheckBox
+from app.ui.widgets.folder_picker import FolderPicker
 from app.ui.widgets.preview_view import PreviewView
 from app.ui.widgets.table_utils import enable_smooth_scroll
-from app.core.file_scanner import FileScanner
 from app.workers.ocr_worker import OcrWorker
 
 
@@ -717,6 +718,16 @@ class AmountPage(QWidget):
         self.progress_bar.percentage = percent
         self.lbl_status.setText(f"({current}/{total}) {message}")
 
+    def _persist_ocr_document_date(self, file_id: str, raw_texts: list[str]) -> None:
+        """解析 OCR 日期并落库；解析失败保持原值，不影响金额流程。"""
+        if not self.store:
+            return
+        document_date = parse_date_from_lines(raw_texts)
+        if not document_date:
+            return
+        kind = "payments" if self._file_type == "image" else "invoices"
+        self.store.set_document_date(kind, file_id, document_date, "ocr")
+
     def _on_ocr_finished(self, result_map: dict):
         """OCR 完成回调：回填识别金额到 Store 与表格。"""
         self._suppress = True
@@ -747,6 +758,8 @@ class AmountPage(QWidget):
                     raw_texts=raw_texts,
                     confidence=confidence,
                 )
+
+            self._persist_ocr_document_date(fid, raw_texts)
 
             # 更新可见行的表格显示
             if row_idx is not None:

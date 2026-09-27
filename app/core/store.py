@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import uuid
+from datetime import date
 from typing import Iterable, Optional
 
 from .models import (
@@ -130,6 +131,9 @@ class Store:
                     old = existing[inv.file_id]
                     inv.linked_payment_ids = old.get("linked_payment_ids", [])
                     inv.amount = AmountRecord.from_dict(old.get("amount"))
+                    if old.get("document_date"):
+                        inv.document_date = old.get("document_date", "")
+                        inv.document_date_source = old.get("document_date_source", "")
                 existing[inv.file_id] = inv.to_dict()
             # 重扫后清理「成员全部缺失/不存在」的空壳发票组合（保留部分缺失组合）
             self._prune_shell_combos("invoice")
@@ -163,6 +167,9 @@ class Store:
                     old = existing[pay.file_id]
                     pay.linked_invoice_ids = old.get("linked_invoice_ids", [])
                     pay.amount = AmountRecord.from_dict(old.get("amount"))
+                    if old.get("document_date"):
+                        pay.document_date = old.get("document_date", "")
+                        pay.document_date_source = old.get("document_date_source", "")
                 existing[pay.file_id] = pay.to_dict()
             # 重扫后清理「成员全部缺失/不存在」的空壳支付组合（保留部分缺失组合）
             self._prune_shell_combos("payment")
@@ -363,6 +370,54 @@ class Store:
                          edited=edited, raw_texts=raw_texts, confidence=confidence,
                          is_confirmed=is_confirmed)
 
+    # ── 日期管理 ────────────────────────────────────────────
+
+    def set_document_date(self, kind: str, file_id: str,
+                          date_iso: str, source: str) -> None:
+        """设置文件的票面日期及来源。kind 支持 invoice/payment 单复数形式。"""
+        data_key = {
+            "invoice": "invoices",
+            "invoices": "invoices",
+            "payment": "payments",
+            "payments": "payments",
+        }.get(kind)
+        if data_key is None:
+            return
+        with self._lock:
+            entry = self._data[data_key].get(file_id)
+            if not entry:
+                return
+            entry["document_date"] = date_iso or ""
+            entry["document_date_source"] = source or ""
+            self._save()
+            self._notify()
+
+    @staticmethod
+    def get_document_date(file: object) -> tuple[str, str]:
+        """读取文件日期；日期为空或非法时回退 modified_iso 的日期部分。
+
+        返回 ``(date_iso, source)``。该函数是引擎与 UI 共用的唯一回退入口。
+        """
+        if isinstance(file, dict):
+            document_date = file.get("document_date", "") or ""
+            document_date_source = file.get("document_date_source", "") or ""
+            modified_iso = file.get("modified_iso", "") or ""
+        else:
+            document_date = getattr(file, "document_date", "") or ""
+            document_date_source = getattr(file, "document_date_source", "") or ""
+            modified_iso = getattr(file, "modified_iso", "") or ""
+
+        document_date = str(document_date).strip()
+        if document_date:
+            try:
+                date.fromisoformat(document_date)
+            except ValueError:
+                pass
+            else:
+                return document_date, str(document_date_source).strip()
+
+        return str(modified_iso)[:10], "file"
+
     def get_confirmed_amounts(self, include_missing: bool = False) -> list[tuple[str, str, float]]:
         """获取所有已确认金额的支付记录。返回 [(payment_id, file_name, amount), ...]
 
@@ -562,6 +617,7 @@ class Store:
         payment_folders: Optional[Iterable[str]] = None,
         tolerance: float = 0.01,
         include_combos: bool = True,
+        time_tolerance_days: Optional[int] = None,
     ) -> list[dict]:
         """查找金额相同的未关联「文件组」配对。
 
@@ -569,6 +625,7 @@ class Store:
         - 单文件金额 ↔ 单文件金额
         - 组合总额 ↔ 单文件金额 / 单文件金额 ↔ 组合总额 / 组合总额 ↔ 组合总额
         任一成员已关联的候选跳过；missing 文件与无金额单元跳过。
+        开启时间条件时，按双方日期区间最近距离过滤；区间重叠距离为 0 天。
 
         Args:
             invoice_folders: 可选，发票侧文件夹过滤（目录路径，取并集）。
@@ -577,6 +634,7 @@ class Store:
             payment_folders: 可选，支付侧文件夹过滤，语义同上。
             tolerance: 金额误差阈值（元），abs 差 ≤ tolerance 视为相同。
             include_combos: 是否纳入组合单元（组合成员不单独匹配的语义不变）。
+            time_tolerance_days: 时间容差（天）；None 表示不过滤，旧行为不变。
 
         Returns:
             [{"invoice_ids": [str], "payment_ids": [str], "invoice_name": str,
@@ -604,6 +662,12 @@ class Store:
                 for pu in pay_units:
                     if abs(iu["amount"] - pu["amount"]) > tolerance:
                         continue
+                    if time_tolerance_days is not None:
+                        distance = self._date_range_distance_days(
+                            iu.get("date_range"), pu.get("date_range")
+                        )
+                        if distance is None or distance > time_tolerance_days:
+                            continue
                     if any(
                         (iid, pid) in linked_pairs
                         for iid in iu["ids"] for pid in pu["ids"]
@@ -632,6 +696,22 @@ class Store:
         """文件所在目录的归一化键（normcase + abspath），用于文件夹范围判定。"""
         return os.path.normcase(os.path.abspath(os.path.dirname(abs_path)))
 
+    @staticmethod
+    def _date_range_distance_days(
+        left: Optional[tuple[date, date]],
+        right: Optional[tuple[date, date]],
+    ) -> Optional[int]:
+        """返回两个日期区间的最近天数；无法判定时为 None。"""
+        if left is None or right is None:
+            return None
+        left_start, left_end = left
+        right_start, right_end = right
+        if left_end < right_start:
+            return (right_start - left_end).days
+        if right_end < left_start:
+            return (left_start - right_end).days
+        return 0
+
     def _build_match_units(self, data_key: str,
                            folder_set: Optional[set[str]] = None,
                            include_combos: bool = True) -> list[dict]:
@@ -641,6 +721,7 @@ class Store:
             data_key: "invoices" | "payments"
             folder_set: 可选目录集合（已归一化）。单文件单元要求所在目录在集合内；
                 组合单元要求全部非 missing 成员所在目录在集合内。
+            单文件日期区间为自身日期；组合日期区间为非 missing 成员的 [min, max]。
             include_combos: False 时不产出组合单元（成员保持“不单独匹配”）。
         """
         kind = "invoice" if data_key == "invoices" else "payment"
@@ -656,6 +737,14 @@ class Store:
                 return True
             return self._dir_key(d.get("abs_path", "")) in folder_set
 
+        def _entry_date(entry: dict) -> Optional[date]:
+            """读取文件日期并提供统一回退。"""
+            date_iso, _ = self.get_document_date(entry)
+            try:
+                return date.fromisoformat(date_iso)
+            except ValueError:
+                return None
+
         units: list[dict] = []
         # 单文件单元（不在任何组合中）
         for fid, d in self._data[data_key].items():
@@ -667,11 +756,14 @@ class Store:
             amt = rec.final_amount
             if amt is None:
                 continue
+            unit_date = _entry_date(d)
+            date_range = (unit_date, unit_date) if unit_date is not None else None
             units.append({
                 "ids": [fid],
                 "name": d.get("file_name", ""),
                 "amount": amt,
                 "is_combo": False,
+                "date_range": date_range,
             })
         # 组合单元（成员金额求和，至少一个成员有金额才纳入）
         if include_combos:
@@ -690,10 +782,14 @@ class Store:
                         continue
                 total = 0.0
                 has_amount = False
+                member_dates: list[date] = []
                 for fid in c.get("file_ids", []):
                     entry = self._data[data_key].get(fid)
                     if not entry or entry.get("missing"):
                         continue
+                    member_date = _entry_date(entry)
+                    if member_date is not None:
+                        member_dates.append(member_date)
                     rec = AmountRecord.from_dict(entry.get("amount"))
                     amt = rec.final_amount
                     if amt is None:
@@ -702,11 +798,15 @@ class Store:
                     has_amount = True
                 if not has_amount:
                     continue
+                date_range = None
+                if member_dates:
+                    date_range = (min(member_dates), max(member_dates))
                 units.append({
                     "ids": list(c["file_ids"]),
                     "name": c.get("name", ""),
                     "amount": round(total, 2),
                     "is_combo": True,
+                    "date_range": date_range,
                 })
         return units
 
