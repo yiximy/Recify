@@ -3,7 +3,7 @@
 
 - 发票/支付模块（源）：名称 + 绑定编辑（同类型候选多选：单文件 + 组合整组，
   显示金额/已关联标记；已被其它模块绑定的文件禁用；组合与其成员互斥、重叠组合互斥）
-- 匹配模块：名称 + 金额容差（±元，默认 0.01）+ 两侧接入摘要
+- 匹配模块：名称 + 金额容差（±元，默认 0.01）+ 时间容差 + 两侧接入摘要
 """
 from __future__ import annotations
 
@@ -13,11 +13,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QDoubleSpinBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QSpinBox,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -35,7 +37,7 @@ from .model import (
 _DIALOG_QSS = """
 QDialog { background: #ffffff; font-family: "Segoe UI", "Microsoft YaHei"; }
 QLabel { color: #606266; font-size: 13px; }
-QDoubleSpinBox, QLineEdit {
+QDoubleSpinBox, QSpinBox, QLineEdit {
     border: 1px solid #dcdfe6; border-radius: 6px;
     padding: 4px 8px; background: #ffffff; color: #303133;
 }
@@ -149,6 +151,27 @@ class NodeConfigDialog(QDialog):
         self.spin_tolerance.setDecimals(2)
         self.spin_tolerance.setValue(0.01)
         layout.addWidget(self.spin_tolerance)
+
+        layout.addWidget(QLabel("时间容差（≤ N 天）"))
+        time_row = QHBoxLayout()
+        self.spin_time_tolerance = QSpinBox()
+        self.spin_time_tolerance.setRange(0, 365)
+        self.spin_time_tolerance.setValue(7)
+        self.spin_time_tolerance.setSuffix(" 天")
+        self.spin_time_tolerance.setToolTip("0 表示必须同日")
+        time_row.addWidget(self.spin_time_tolerance)
+        self.check_time_unlimited = QCheckBox("不限制时间")
+        self.check_time_unlimited.toggled.connect(
+            self.spin_time_tolerance.setDisabled)
+        time_row.addWidget(self.check_time_unlimited)
+        time_row.addStretch()
+        layout.addLayout(time_row)
+
+        time_note = QLabel(
+            "按票面日期（识别失败回退文件时间）比较两侧最近距离")
+        time_note.setWordWrap(True)
+        time_note.setStyleSheet(f"color: {_GRAY}; font-size: 12px;")
+        layout.addWidget(time_note)
 
         summary = QLabel(self._match_summary or "当前未接入任何发票/支付模块")
         summary.setWordWrap(True)
@@ -346,6 +369,10 @@ class NodeConfigDialog(QDialog):
         else:
             self.spin_tolerance.setValue(
                 float(self._node.params.get("tolerance", 0.01)))
+            self.spin_time_tolerance.setValue(
+                int(self._node.params.get("time_tolerance_days", 7)))
+            self.check_time_unlimited.setChecked(
+                bool(self._node.params.get("time_unlimited", False)))
 
     def accept(self):
         name = self.input_name.text().strip()
@@ -372,4 +399,8 @@ class NodeConfigDialog(QDialog):
         else:
             self._node.params["tolerance"] = round(
                 self.spin_tolerance.value(), 2)
+            self._node.params["time_tolerance_days"] = \
+                self.spin_time_tolerance.value()
+            self._node.params["time_unlimited"] = \
+                self.check_time_unlimited.isChecked()
         super().accept()

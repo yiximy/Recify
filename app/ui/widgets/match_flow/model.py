@@ -22,7 +22,11 @@ KIND_LABELS = {
 }
 KIND_SOURCES = {KIND_INVOICE, KIND_PAYMENT}
 
-DEFAULT_PARAMS = {"tolerance": 0.01}
+DEFAULT_PARAMS = {
+    "tolerance": 0.01,
+    "time_tolerance_days": 7,
+    "time_unlimited": False,
+}
 
 
 def _new_id(prefix: str) -> str:
@@ -39,7 +43,7 @@ class FlowNode:
         name: 展示名（可编辑；自动铺时源=文件/组合名、匹配=「匹配 ¥金额」）
         file_ids: 源模块直接绑定的单文件（非组合成员）
         combo_ids: 源模块绑定的组合整组（combo_id 引用）
-        params: 匹配模块参数，仅 {"tolerance": float}
+        params: 匹配模块参数（金额容差、时间容差 / 不限制时间）
         x/y: 卡片左上角在画布场景坐标系中的位置
     """
 

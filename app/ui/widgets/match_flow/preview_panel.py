@@ -53,6 +53,8 @@ class PreviewFile:
     abs_path: str
     missing: bool
     combo_name: str = ""
+    date_iso: str = ""
+    date_source: str = ""
 
 
 class MatchFlowPreviewPanel(QFrame):
@@ -249,6 +251,9 @@ class MatchFlowPreviewPanel(QFrame):
 
     def _add_file_item(self, file: PreviewFile) -> None:
         label = file.name
+        if file.date_iso:
+            source_label = "票面" if file.date_source == "ocr" else "文件"
+            label += f" · {file.date_iso}（{source_label}）"
         if file.combo_name:
             label += f"  ·  组合「{file.combo_name}」"
         if file.missing:
@@ -378,8 +383,7 @@ class MatchFlowPreviewPanel(QFrame):
                     files, seen, getter, node.kind, file_id, combo_name)
         return files
 
-    @staticmethod
-    def _append_file(files: list[PreviewFile], seen: set[str], getter,
+    def _append_file(self, files: list[PreviewFile], seen: set[str], getter,
                      kind: str, file_id: str, combo_name: str) -> None:
         if file_id in seen:
             return
@@ -394,5 +398,11 @@ class MatchFlowPreviewPanel(QFrame):
             or not path or not os.path.isfile(path)
         name = getattr(file, "file_name", "") or os.path.basename(path) \
             or f"未知文件 {file_id[:8]}"
+        date_iso = ""
+        date_source = ""
+        get_document_date = getattr(self.store, "get_document_date", None)
+        if callable(get_document_date):
+            date_iso, date_source = get_document_date(file)
         files.append(PreviewFile(
-            file_id, kind, name, path, missing, combo_name))
+            file_id, kind, name, path, missing, combo_name,
+            date_iso, date_source))

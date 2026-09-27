@@ -7,12 +7,13 @@
 匹配→每个同额支付单元 1 条出线）；多发票单元 × 多支付单元 → 每发票单元各自
 1 个匹配模块（发票单元是聚合键）。支付模块跨候选仍共享。
 「确定并执行」：validate（缺项不关窗）→ 聚合链展开为 (匹配模块 × 支付模块)
-支线，逐支线校验（发票单元金额 vs 该支付单元金额差 ≤ 链容差）→
+支线，逐支线校验金额差与日期区间最近距离是否均在容差内 →
 store.batch_link(auto_linked=True) → result_summary（含 skipped/skip_reasons）。
 store.py 引擎不参与重算（候选只在打开时铺一次，之后由用户编辑决定执行）。
 """
 from __future__ import annotations
 
+from datetime import date
 from typing import Optional
 
 from PySide6.QtCore import QMimeData, QPoint, QRect, QRectF, QSize, Qt, QTimer
@@ -43,6 +44,7 @@ from app.ui.widgets.match_flow.items import (
 )
 from app.ui.widgets.match_flow.model import (
     FlowModel,
+    FlowNode,
     KIND_INVOICE,
     KIND_LABELS,
     KIND_MATCH,
@@ -419,11 +421,11 @@ class MatchFlowDialog(QDialog):
     # ── 自动铺候选链 ──
 
     def _auto_place(self):
-        """打开时自动铺候选链：store.get_amount_matches() 原样调用，不重算引擎。"""
+        """打开时按默认 7 天时间容差铺候选链，不重算引擎。"""
         if self.store is None:
             return
         try:
-            matches = self.store.get_amount_matches()
+            matches = self.store.get_amount_matches(time_tolerance_days=7)
         except Exception:
             matches = []
             self._show_status(
@@ -432,7 +434,8 @@ class MatchFlowDialog(QDialog):
             return
         if not matches:
             self._show_status(
-                "未找到金额匹配的未关联配对（无金额或已全部关联）：可从左侧拖入模块手动搭建",
+                "未找到金额匹配的未关联配对（无金额或已全部关联；可能因时间条件被排除，"
+                "可在匹配模块调大容差或选择不限制）：可从左侧拖入模块手动搭建",
                 False)
             return
         chains = self._build_candidate_chains(matches)
@@ -608,13 +611,49 @@ class MatchFlowDialog(QDialog):
         if self.lbl_status.text() == self._status_text:
             self.lbl_status.setText("")
 
+    def _node_date_range(self, node: FlowNode) -> Optional[tuple[date, date]]:
+        """取源节点全部有效成员的日期区间；无可用日期时返回 None。"""
+        if self.store is None or not node.is_source:
+            return None
+        getter = self.store.get_invoice if node.kind == KIND_INVOICE \
+            else self.store.get_payment
+        dates: list[date] = []
+        for file_id in node.canonical_file_ids(self.store):
+            file = getter(file_id)
+            if file is None:
+                continue
+            date_iso, _source = self.store.get_document_date(file)
+            try:
+                dates.append(date.fromisoformat(date_iso))
+            except (TypeError, ValueError):
+                continue
+        if not dates:
+            return None
+        return min(dates), max(dates)
+
+    @staticmethod
+    def _date_range_distance_days(
+        left: Optional[tuple[date, date]],
+        right: Optional[tuple[date, date]],
+    ) -> Optional[int]:
+        """两个日期区间重叠为 0 天，否则返回最近端点距离。"""
+        if left is None or right is None:
+            return None
+        left_start, left_end = left
+        right_start, right_end = right
+        if left_end < right_start:
+            return (right_start - left_end).days
+        if right_end < left_start:
+            return (left_start - right_end).days
+        return 0
+
     # ── 确定执行（v2 管线：锁定模型，不重算引擎）──
 
     def _on_confirm(self):
         """校验 → 逐支线容差判定 → batch_link(auto_linked=True) → result_summary。
 
         一对多聚合链展开为 (匹配模块 × 支付模块) 支线：每个支线独立做
-        发票单元金额 vs 该支付单元金额的容差判定，跳过原因逐支线记录。
+        发票单元金额差与日期区间距离判定，跳过原因逐支线记录。
         """
         if self.store is None:
             MkMessage.warning(self, "数据未初始化")
@@ -654,13 +693,38 @@ class MatchFlowDialog(QDialog):
                 inv_amt = inv.bind_amount(self.store)
                 pay_amt = pay.bind_amount(self.store)
                 tol = float(m.params.get("tolerance", 0.01))
-                if abs(inv_amt - pay_amt) <= tol + 1e-9:
+                if abs(inv_amt - pay_amt) > tol + 1e-9:
+                    skipped.append(
+                        f"「{m.name}」→「{pay.name}」金额差超出容差：¥{inv_amt:,.2f} "
+                        f"vs ¥{pay_amt:,.2f}（±{tol:g}）")
+                    continue
+
+                if bool(m.params.get("time_unlimited", False)):
+                    time_ok = True
+                    time_reason = ""
+                else:
+                    time_tolerance = int(
+                        m.params.get("time_tolerance_days", 7))
+                    distance = self._date_range_distance_days(
+                        self._node_date_range(inv), self._node_date_range(pay))
+                    if distance is None:
+                        time_ok = False
+                        time_reason = "时间差超出容差（无法确定日期）"
+                    elif distance > time_tolerance:
+                        time_ok = False
+                        time_reason = (
+                            f"时间差超出容差（{distance} 天 > "
+                            f"{time_tolerance} 天）")
+                    else:
+                        time_ok = True
+                        time_reason = ""
+
+                if time_ok:
                     ok_pairs.append(
                         {"invoice_ids": inv_ids, "payment_ids": pay_ids})
                 else:
                     skipped.append(
-                        f"「{m.name}」→「{pay.name}」金额差超出容差：¥{inv_amt:,.2f} "
-                        f"vs ¥{pay_amt:,.2f}（±{tol:g}）")
+                        f"「{m.name}」→「{pay.name}」{time_reason}")
             count = self.store.batch_link(ok_pairs, auto_linked=True) \
                 if ok_pairs else 0
         finally:

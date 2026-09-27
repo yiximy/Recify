@@ -75,6 +75,14 @@ def _fmt_amount(amount: Optional[float]) -> str:
     return f"¥{amount:,.2f}"
 
 
+def _time_condition_text(params: dict) -> str:
+    """匹配模块时间条件摘要：不限时间 / 同日 / ≤N天。"""
+    if params.get("time_unlimited", False):
+        return "不限时间"
+    days = int(params.get("time_tolerance_days", 7))
+    return "同日" if days == 0 else f"≤{days}天"
+
+
 def _make_bezier(p0: QPointF, p3: QPointF) -> QPainterPath:
     """横向出/入端的贝塞尔连线（Node-RED 风格自动路径）。"""
     path = QPainterPath(p0)
@@ -272,6 +280,7 @@ class FlowNodeItem(QGraphicsItem):
         else:
             tol = self.node.params.get("tolerance", 0.01)
             lines.append(f"金额容差：±{tol:g} 元")
+            lines.append(f"时间条件：{_time_condition_text(self.node.params)}")
             lines.append(f"链金额：{_fmt_amount(self._match_amount)}")
             lines.append(f"接入：发票 {self._inv_in} 路 → 支付 {self._pay_out} 路")
         lines.append("左右端口均可拖动连接 · 双击配置 · 右键菜单 · 节点可拖动")
@@ -458,7 +467,8 @@ class FlowNodeItem(QGraphicsItem):
             info2 = QRectF(10, HEADER_H + 44, NODE_W - 20, 16)
             painter.drawText(info2,
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                             f"±{tol:g} 元 · 发票 {self._inv_in} 入 · 支付 {self._pay_out} 出")
+                             f"±{tol:g} 元 · {_time_condition_text(self.node.params)}"
+                             f" · 发票 {self._inv_in} 入 · 支付 {self._pay_out} 出")
 
         # 源模块：右下角金额徽标
         if self.node.is_source and self._badge_text:
