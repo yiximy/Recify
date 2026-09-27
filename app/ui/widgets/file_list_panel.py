@@ -35,7 +35,7 @@ from app.core.models import InvoiceFile, PaymentFile
 COL_SEQ = 0       # 序号
 COL_NAME = 1      # 文件名
 COL_AMOUNT = 2    # 金额
-COL_DATE = 3      # 修改日期
+COL_DATE = 3      # 日期（优先票面日期，回退文件修改时间）
 COL_STATUS = 4    # 状态徽标
 
 STATUS_COL_WIDTH = 84
@@ -186,7 +186,7 @@ def _format_date(iso_str: str) -> str:
     parts = iso_str.split("T")
     date_part = parts[0]
     time_part = parts[1][:5] if len(parts) > 1 else ""
-    return f"{date_part} {time_part}"
+    return f"{date_part} {time_part}".strip()
 
 
 class FileListPanel(QWidget):
@@ -279,7 +279,7 @@ class FileListPanel(QWidget):
         # ── 文件树 ──
         self.tree = _HierarchyTree()
         self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(["序号", "文件名", "金额", "修改日期", "状态"])
+        self.tree.setHeaderLabels(["序号", "文件名", "金额", "日期", "状态"])
         self.tree.setRootIsDecorated(True)          # 显示展开箭头（仅对有子项者）
         self.tree.setIndentation(18)
         self.tree.setExpandsOnDoubleClick(True)
@@ -417,9 +417,22 @@ class FileListPanel(QWidget):
         item.setText(COL_NAME, f.file_name)
         item.setToolTip(COL_NAME, f.file_name)
         item.setText(COL_AMOUNT, self._format_amount(f))
-        item.setText(COL_DATE, _format_date(f.modified_iso))
+        self._set_date_cell(item, f)
         self._rebuild_children(item, f)
         return item
+
+    def _set_date_cell(self, item: QTreeWidgetItem, f) -> None:
+        """日期列：优先票面日期（OCR），未识别到时回退显示文件修改时间。"""
+        if self.store is not None:
+            date_iso, source = self.store.get_document_date(f)
+        else:
+            date_iso, source = "", ""
+        if date_iso and source == "ocr":
+            item.setText(COL_DATE, _format_date(date_iso))
+            item.setToolTip(COL_DATE, "票面日期（OCR 识别）")
+        else:
+            item.setText(COL_DATE, _format_date(getattr(f, "modified_iso", "")))
+            item.setToolTip(COL_DATE, "文件修改时间（未识别到票面日期）")
 
     def _rebuild_children(self, item: QTreeWidgetItem, f):
         """（重建）子行：展开后列出全部关联文件名；未关联则无子项（无展开箭头）。
@@ -459,7 +472,7 @@ class FileListPanel(QWidget):
         child.setText(COL_NAME, mf.file_name)
         child.setToolTip(COL_NAME, mf.file_name)
         child.setText(COL_AMOUNT, self._format_amount(mf))
-        child.setText(COL_DATE, _format_date(mf.modified_iso))
+        self._set_date_cell(child, mf)
         self._rebuild_children(child, mf)
         return child
 
