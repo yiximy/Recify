@@ -582,3 +582,14 @@ def _on_confirm():
 - match_flow_dialog.py：自动铺固定调用 get_amount_matches(time_tolerance_days=7) 并补充空态说明；confirm 逐支线按绑定成员日期 min/max 计算区间最近距离，金额通过后再校验时间并区分跳过原因。
 - preview_panel.py：列表项按 Store.get_document_date 返回日期/来源，显示 文件名 · YYYY-MM-DD（票面/文件）。
 - 验证：离屏临时 Store/真实对话框覆盖自动铺 7 天与不限时间、配置联动/params/摘要、confirm 金额/时间跳过、预览日期来源；清理临时脚本后运行现有回归与 scripts/check.sh。
+
+---
+
+## 2026-09-27 实现方案：匹配参数持久化 + 金额页识别日期
+
+- `AppConfig.DEFAULTS` 增加 `match_time_tolerance_days` / `match_time_unlimited` / `match_amount_tolerance` 三个偏好键。
+- 将 `MainWindow.config` 注入 `ComparePage`，再由 `ComparePage` 传入 `MatchFlowDialog`，并继续传给 `NodeConfigDialog`，保持现有构造函数可选兼容。
+- `MatchFlowDialog` 自动铺时按偏好调用 `get_amount_matches(tolerance=..., time_tolerance_days=...)`；新匹配模块（自动铺和拖入）初始化同一组 params。
+- `NodeConfigDialog` 保存匹配模块时回写 node.params，并同步 `AppConfig.set(...)` 后 `save()`。
+- `AmountPage` 表格列调整为“文件名 / 日期 / 识别金额 / 编辑金额 / 确认”；日期仅展示 `get_document_date(..., source="ocr")`，否则显示灰色 `—`，OCR 完成与页面刷新时同步更新。
+- 使用临时 config/store 的离屏脚本覆盖持久化、自动铺参数、新建模块 params、日期展示、OCR 回填和编辑/确认列索引；清理后运行 `scripts/check.sh`。
