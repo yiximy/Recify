@@ -35,8 +35,8 @@ LOW_CONFIDENCE = 0.8
 # 表格行高下限：确保编辑输入框完整显示，不被截断（实际按输入框高度自适应）
 ROW_HEIGHT = 46
 
-# 日期列宽：容纳 YYYY-MM-DD 或占位符
-DATE_COL_WIDTH = 170
+# 日期列宽：容纳日期文本、日历下拉与清除按钮
+DATE_COL_WIDTH = 200
 # 编辑金额列宽：足以完整显示较大金额（含 "99999999.99" 级别）
 EDIT_COL_WIDTH = 180
 # 确认列宽：仅放一个居中复选框
@@ -570,8 +570,8 @@ class AmountPage(QWidget):
         for f in self._filtered_files:
             amount = self._get_file_amount(f)
             recognized_text = f"{amount:.2f}" if amount is not None else "—"
-            date_text, _placeholder = self._get_date_display(f)
-            rows.append([f.file_name, date_text, recognized_text, "", ""])
+            # 日期列仅由 DateEditCell 绘制，表项留空避免透明控件下双层文字。
+            rows.append([f.file_name, "", recognized_text, "", ""])
 
         self.table.set_data(rows)
 
