@@ -26,6 +26,9 @@ from PySide6.QtWidgets import (
 
 from monkeyqt import MkButton, MkInput, MkMessage
 from .folder_picker import FolderPicker
+from .list_view_state import (
+    TreeViewState, capture_tree_view_state, restore_tree_view_state,
+)
 from .status_badge import StatusBadge
 from .table_utils import enable_smooth_scroll
 from app.core.file_scanner import FileScanner
@@ -74,7 +77,7 @@ QTreeWidget {
 QTreeWidget::item {
     background: transparent;
     border-bottom: 1px solid #ebeef5;
-    padding: 6px 4px;
+    padding: 2px 4px;
 }
 QTreeWidget::item:hover {
     background: #f5f7fa;
@@ -88,7 +91,7 @@ QHeaderView::section {
     color: #909399;
     border: none;
     border-bottom: 1px solid #ebeef5;
-    padding: 8px 6px;
+    padding: 6px 6px;
     font-weight: 700;
 }
 QScrollBar:vertical {
@@ -259,7 +262,9 @@ class FileListPanel(QWidget):
         layout.addLayout(find_bar)
 
         # ── 定位状态栏：另一侧「定位所有」时显示并可清除 ──
-        locate_bar = QHBoxLayout()
+        self.locate_bar = QWidget()
+        locate_bar = QHBoxLayout(self.locate_bar)
+        locate_bar.setContentsMargins(0, 0, 0, 0)
         locate_bar.setSpacing(8)
 
         self.lbl_locate_status = QLabel("")
@@ -274,7 +279,8 @@ class FileListPanel(QWidget):
         locate_bar.addWidget(self.btn_clear_locate)
 
         locate_bar.addStretch()
-        layout.addLayout(locate_bar)
+        layout.addWidget(self.locate_bar)
+        self.locate_bar.setVisible(False)
 
         # ── 文件树 ──
         self.tree = _HierarchyTree()
@@ -342,7 +348,13 @@ class FileListPanel(QWidget):
 
     # ── 树填充 ──────────────────────────────────────────────
 
-    def _populate_tree(self, files: list):
+    def _populate_tree(
+        self,
+        files: list,
+        view_state: Optional[TreeViewState] = None,
+        *,
+        advance: bool = False,
+    ):
         """按文件列表重建树（三层：独立文件/组合父行 → 成员文件 → 关联对象）。
 
         顶层项两类：独立文件（不在任何组合中）与组合父行（默认展开，金额=总和）；
@@ -402,6 +414,7 @@ class FileListPanel(QWidget):
         # 重新应用当前查找过滤（若有）
         self._on_find(self.input_find.text())
         self._update_locate_status()
+        restore_tree_view_state(self.tree, view_state, advance=advance)
 
     @staticmethod
     def _format_amount(f) -> str:
@@ -624,12 +637,14 @@ class FileListPanel(QWidget):
     def set_located_files(self, file_ids: Optional[list[str]]):
         """在另一侧定位关联文件：仅显示给定 file_id 列表。"""
         self._located_file_ids = set(file_ids) if file_ids else None
-        self.input_find.clear()
+        if file_ids:
+            # 进入定位视图才清空搜索；清除定位（None）时保留用户查找词
+            self.input_find.clear()
         self._update_locate_status()
         self._apply_visibility()
 
     def clear_located_files(self):
-        """清除定位过滤，恢复完整列表。"""
+        """清除定位过滤，恢复完整列表（不动查找词）。"""
         self.set_located_files(None)
 
     def locate_file(self, file_id: str):
@@ -646,9 +661,11 @@ class FileListPanel(QWidget):
             )
             self.lbl_locate_status.setText(f"已定位 {count} 个关联文件")
             self.btn_clear_locate.setVisible(True)
+            self.locate_bar.setVisible(True)
         else:
             self.lbl_locate_status.setText("")
             self.btn_clear_locate.setVisible(False)
+            self.locate_bar.setVisible(False)
 
     # ── 选择与查询 ──────────────────────────────────────────
 
@@ -683,16 +700,26 @@ class FileListPanel(QWidget):
             return None
         return self.store.get_combo(combo_id)
 
-    def reload_from_store(self):
+    def reload_from_store(
+        self,
+        keep_view: bool = True,
+        advance: bool = False,
+    ):
         """从 Store 重新拉取文件并重建树（组合增删后调用）。"""
         if not self.store:
             return
+        view_state = capture_tree_view_state(self.tree) if keep_view else None
         if self.kind == "invoice":
             files = self.store.get_invoices()
         else:
             files = self.store.get_payments()
         self._files = files
-        self._populate_tree(files)
+        has_query = bool((self.input_find.text() or "").strip())
+        self._populate_tree(
+            files,
+            view_state,
+            advance=advance and not has_query,
+        )
 
     def select_by_id(self, file_id: str):
         """程序化选中指定 ID 的文件（用于自动比对审阅模式）。"""

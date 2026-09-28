@@ -281,6 +281,18 @@ class Store:
                 if new_p != old_p and os.path.exists(new_p):
                     return None
 
+            # 生成新 file_id（路径变了但 mtime 不变）
+            new_inv_id = generate_file_id(inv_new, inv["modified_iso"])
+            new_pay_id = generate_file_id(pay_new, pay["modified_iso"])
+
+            # 保序重键前先检查冲突，避免静默合并条目
+            if (new_inv_id != invoice_id
+                    and new_inv_id in self._data["invoices"]):
+                return None
+            if (new_pay_id != payment_id
+                    and new_pay_id in self._data["payments"]):
+                return None
+
             # 磁盘重命名
             try:
                 if inv_new != inv["abs_path"]:
@@ -290,9 +302,6 @@ class Store:
             except OSError:
                 return None
 
-            # 生成新 file_id（路径变了但 mtime 不变）
-            new_inv_id = generate_file_id(inv_new, inv["modified_iso"])
-            new_pay_id = generate_file_id(pay_new, pay["modified_iso"])
             old_to_new = {}
             if new_inv_id != invoice_id:
                 old_to_new[invoice_id] = new_inv_id
@@ -304,16 +313,20 @@ class Store:
             inv["file_name"] = os.path.basename(inv_new)
             if new_inv_id != invoice_id:
                 inv["file_id"] = new_inv_id
-                self._data["invoices"][new_inv_id] = inv
-                del self._data["invoices"][invoice_id]
+                self._data["invoices"] = {
+                    new_inv_id if key == invoice_id else key: value
+                    for key, value in self._data["invoices"].items()
+                }
 
             # 更新支付条目
             pay["abs_path"] = pay_new
             pay["file_name"] = os.path.basename(pay_new)
             if new_pay_id != payment_id:
                 pay["file_id"] = new_pay_id
-                self._data["payments"][new_pay_id] = pay
-                del self._data["payments"][payment_id]
+                self._data["payments"] = {
+                    new_pay_id if key == payment_id else key: value
+                    for key, value in self._data["payments"].items()
+                }
 
             # 更新所有交叉引用：linked_*_ids 列表 + associations 表
             for old, new in old_to_new.items():
@@ -330,6 +343,12 @@ class Store:
                         a["invoice_id"] = new
                     if a["payment_id"] == old:
                         a["payment_id"] = new
+                for combo in self._data.get("combos", []):
+                    if old in combo.get("file_ids", []):
+                        combo["file_ids"] = [
+                            new if fid == old else fid
+                            for fid in combo["file_ids"]
+                        ]
 
             self._save()
             self._notify()

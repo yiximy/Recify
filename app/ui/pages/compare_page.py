@@ -65,6 +65,8 @@ class ComparePage(QWidget):
         layout.addLayout(toolbar)
 
         # ── 上半部分：左右双栏文件列表 ──
+        self.main_splitter = QSplitter(Qt.Vertical)
+
         lists_splitter = QSplitter(Qt.Horizontal)
 
         self.invoice_panel = FileListPanel(kind="invoice", store=self.store)
@@ -74,10 +76,11 @@ class ComparePage(QWidget):
         lists_splitter.addWidget(self.payment_panel)
 
         lists_splitter.setSizes([500, 500])
-        layout.addWidget(lists_splitter, stretch=2)
+        self.main_splitter.addWidget(lists_splitter)
 
         # ── 下半部分：双预览区 ──
         preview_splitter = QSplitter(Qt.Horizontal)
+        preview_splitter.setMinimumHeight(120)
 
         self.invoice_preview = PreviewView(title="发票预览")
         preview_splitter.addWidget(self.invoice_preview)
@@ -86,7 +89,13 @@ class ComparePage(QWidget):
         preview_splitter.addWidget(self.payment_preview)
 
         preview_splitter.setSizes([500, 500])
-        layout.addWidget(preview_splitter, stretch=3)
+        self.main_splitter.addWidget(preview_splitter)
+        self.main_splitter.setSizes([420, 280])   # 初值偏列表；余量按下方 stretch 3:2 分配
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setCollapsible(1, True)
+        layout.addWidget(self.main_splitter, stretch=1)
 
         # ── 底部关联操作按钮 ──
         btn_bar = QHBoxLayout()
@@ -338,9 +347,16 @@ class ComparePage(QWidget):
                 self,
                 f"重命名成功！\n发票：{inv_name}\n支付记录：{pay_name}",
             )
-            # 刷新两个面板
-            self.invoice_panel.restore_folder()
-            self.payment_panel.restore_folder()
+            # file_id 已变，旧定位过滤必须先清除，避免重载后变成空结果
+            self.invoice_panel.clear_located_files()
+            self.payment_panel.clear_located_files()
+            # 仅重载 Store（不重扫），并顺手下移一格
+            self.invoice_panel.reload_from_store(
+                keep_view=True, advance=True,
+            )
+            self.payment_panel.reload_from_store(
+                keep_view=True, advance=True,
+            )
         else:
             MkMessage.error(
                 self, "重命名失败，可能目标文件已存在或文件被占用。"
