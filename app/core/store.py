@@ -13,6 +13,9 @@ from .models import (
     InvoiceFile, PaymentFile, Association, AmountRecord,
     generate_file_id, now_iso,
 )
+from .rename_plan import (
+    has_target_conflict, plan_target_paths, remap_dict_keys, rename_paths,
+)
 
 
 class Store:
@@ -258,103 +261,131 @@ class Store:
             inv = self._data["invoices"].get(invoice_id)
             return bool(inv and payment_id in inv.get("linked_payment_ids", []))
 
-    def rename_linked_files(self, invoice_id: str, payment_id: str,
-                            new_base_name: str) -> tuple[str, str] | None:
-        """重命名关联的发票与支付文件为统一基名（保留各自扩展名）。
+    def rename_group(self, invoice_ids: list[str], payment_ids: list[str],
+                     new_base: str,
+                     combo_ids: Iterable[str] = ()) -> list[str] | None:
+        """把一组发票与支付文件统一重命名为 new_base（保留各自扩展名）。
 
-        文件在磁盘上重命名后，同步更新 Store 内的路径、file_id 及所有交叉引用，
-        下次重扫不会丢失关联。
+        组内文件按 (所在目录, 扩展名) 分组编号：第 1 个为 <new_base><ext>，
+        其后依次 _2、_3…；同目录同扩展名保证唯一，跨目录/跨扩展名互不影响。
+        冲突即失败（不自动跳号）：任一目标路径被本组之外的文件占用则返回 None；
+        任一磁盘重命名失败则回滚已改文件，保证磁盘与 Store 一致。
+
+        Args:
+            combo_ids: 需要同步改名的组合 id（其 name 改为 new_base）。
+
+        Returns:
+            按 [invoice_ids..., payment_ids...] 顺序的新文件名列表；失败返回 None。
         """
         with self._lock:
-            inv = self._data["invoices"].get(invoice_id)
-            pay = self._data["payments"].get(payment_id)
-            if not inv or not pay:
-                return None
-
-            inv_dir = os.path.dirname(inv["abs_path"])
-            pay_dir = os.path.dirname(pay["abs_path"])
-            inv_new = os.path.join(inv_dir, new_base_name + inv["ext"])
-            pay_new = os.path.join(pay_dir, new_base_name + pay["ext"])
-
-            # 冲突检查（跳过自身，允许原地同名）
-            for new_p, old_p in [(inv_new, inv["abs_path"]), (pay_new, pay["abs_path"])]:
-                if new_p != old_p and os.path.exists(new_p):
+            entries: list[dict] = []
+            seen_inv: set[str] = set()
+            for iid in invoice_ids:
+                if iid in seen_inv:
+                    continue
+                seen_inv.add(iid)
+                entry = self._data["invoices"].get(iid)
+                if entry is None:
                     return None
-
-            # 生成新 file_id（路径变了但 mtime 不变）
-            new_inv_id = generate_file_id(inv_new, inv["modified_iso"])
-            new_pay_id = generate_file_id(pay_new, pay["modified_iso"])
-
-            # 保序重键前先检查冲突，避免静默合并条目
-            if (new_inv_id != invoice_id
-                    and new_inv_id in self._data["invoices"]):
-                return None
-            if (new_pay_id != payment_id
-                    and new_pay_id in self._data["payments"]):
-                return None
-
-            # 磁盘重命名
-            try:
-                if inv_new != inv["abs_path"]:
-                    os.rename(inv["abs_path"], inv_new)
-                if pay_new != pay["abs_path"]:
-                    os.rename(pay["abs_path"], pay_new)
-            except OSError:
+                entries.append(entry)
+            seen_pay: set[str] = set()
+            for pid in payment_ids:
+                if pid in seen_pay:
+                    continue
+                seen_pay.add(pid)
+                entry = self._data["payments"].get(pid)
+                if entry is None:
+                    return None
+                entries.append(entry)
+            if not entries or not new_base:
                 return None
 
-            old_to_new = {}
-            if new_inv_id != invoice_id:
-                old_to_new[invoice_id] = new_inv_id
-            if new_pay_id != payment_id:
-                old_to_new[payment_id] = new_pay_id
+            targets = plan_target_paths(entries, new_base)
+            if has_target_conflict(entries, targets):
+                return None
 
-            # 更新发票条目
-            inv["abs_path"] = inv_new
-            inv["file_name"] = os.path.basename(inv_new)
-            if new_inv_id != invoice_id:
-                inv["file_id"] = new_inv_id
-                self._data["invoices"] = {
-                    new_inv_id if key == invoice_id else key: value
-                    for key, value in self._data["invoices"].items()
-                }
+            old_to_new: dict[str, str] = {}
+            for entry, target in zip(entries, targets):
+                new_id = generate_file_id(target, entry["modified_iso"])
+                if new_id != entry["file_id"]:
+                    old_to_new[entry["file_id"]] = new_id
+            new_invoices = remap_dict_keys(self._data["invoices"], old_to_new)
+            new_payments = remap_dict_keys(self._data["payments"], old_to_new)
+            if new_invoices is None or new_payments is None:
+                return None
 
-            # 更新支付条目
-            pay["abs_path"] = pay_new
-            pay["file_name"] = os.path.basename(pay_new)
-            if new_pay_id != payment_id:
-                pay["file_id"] = new_pay_id
-                self._data["payments"] = {
-                    new_pay_id if key == payment_id else key: value
-                    for key, value in self._data["payments"].items()
-                }
+            pairs = list(zip([e["abs_path"] for e in entries], targets))
+            if not rename_paths(pairs):
+                return None
 
-            # 更新所有交叉引用：linked_*_ids 列表 + associations 表
-            for old, new in old_to_new.items():
-                for inv_d in self._data["invoices"].values():
-                    lp = inv_d.get("linked_payment_ids", [])
-                    if old in lp:
-                        lp[lp.index(old)] = new
-                for pay_d in self._data["payments"].values():
-                    li = pay_d.get("linked_invoice_ids", [])
-                    if old in li:
-                        li[li.index(old)] = new
-                for a in self._data["associations"]:
-                    if a["invoice_id"] == old:
-                        a["invoice_id"] = new
-                    if a["payment_id"] == old:
-                        a["payment_id"] = new
-                for combo in self._data.get("combos", []):
-                    if old in combo.get("file_ids", []):
-                        combo["file_ids"] = [
-                            new if fid == old else fid
-                            for fid in combo["file_ids"]
-                        ]
+            for entry, target in zip(entries, targets):
+                entry["abs_path"] = target
+                entry["file_name"] = os.path.basename(target)
+                entry["file_id"] = old_to_new.get(
+                    entry["file_id"], entry["file_id"]
+                )
+            self._data["invoices"] = new_invoices
+            self._data["payments"] = new_payments
+            if old_to_new:
+                self._remap_file_ids(old_to_new)
+            for combo_id in dict.fromkeys(combo_ids):
+                combo = next(
+                    (c for c in self._data.get("combos", [])
+                     if c["combo_id"] == combo_id),
+                    None,
+                )
+                if combo:
+                    combo["name"] = new_base
 
             self._save()
             self._notify()
-            new_inv_name = inv["file_name"]
-            new_pay_name = pay["file_name"]
-            return (new_inv_name, new_pay_name)
+            return [os.path.basename(t) for t in targets]
+
+    def _remap_file_ids(self, old_to_new: dict[str, str]):
+        """把交叉引用（linked_*_ids / associations / combos.file_ids）旧 id 换新。"""
+        for old, new in old_to_new.items():
+            for inv_d in self._data["invoices"].values():
+                linked = inv_d.get("linked_payment_ids", [])
+                if old in linked:
+                    linked[linked.index(old)] = new
+            for pay_d in self._data["payments"].values():
+                linked = pay_d.get("linked_invoice_ids", [])
+                if old in linked:
+                    linked[linked.index(old)] = new
+            for assoc in self._data["associations"]:
+                if assoc["invoice_id"] == old:
+                    assoc["invoice_id"] = new
+                if assoc["payment_id"] == old:
+                    assoc["payment_id"] = new
+            for combo in self._data.get("combos", []):
+                if old in combo.get("file_ids", []):
+                    combo["file_ids"] = [
+                        new if fid == old else fid
+                        for fid in combo["file_ids"]
+                    ]
+
+    def rename_linked_files(self, invoice_id: str, payment_id: str,
+                            new_base_name: str) -> tuple[str, str] | None:
+        """薄封装：转调 rename_group([invoice_id], [payment_id])。
+
+        保持既有返回值 (发票新名, 支付新名) 与失败返回 None 的语义。
+        """
+        names = self.rename_group([invoice_id], [payment_id], new_base_name)
+        if names is None or len(names) != 2:
+            return None
+        return names[0], names[1]
+
+    def group_link_exists(self, invoice_ids: Iterable[str],
+                          payment_ids: Iterable[str]) -> bool:
+        """两组文件之间是否存在至少 1 条关联。"""
+        with self._lock:
+            pay_set = set(payment_ids)
+            for iid in invoice_ids:
+                inv = self._data["invoices"].get(iid)
+                if inv and pay_set.intersection(
+                        inv.get("linked_payment_ids", [])):
+                    return True
+            return False
 
     # ── 金额管理 ────────────────────────────────────────────
 

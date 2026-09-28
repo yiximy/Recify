@@ -20,13 +20,11 @@ class ComparePage(QWidget):
 
     布局：
         ┌─────────────────────────────────────────┐
-        │ [自动比对]                               │
-        ├─────────────┬───────────────────────────┤
         │ 发票列表(PDF)│ 支付记录列表               │
         ├─────────────┴───────────────────────────┤
         │ [发票预览]   [支付截图预览]               │
         ├─────────────────────────────────────────┤
-        │   [关联选中项]    [取消关联]              │
+        │[自动比对][关联选中项][取消关联][重命名关联]│
         └─────────────────────────────────────────┘
     """
 
@@ -43,26 +41,6 @@ class ComparePage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-
-        # ── 自动比对工具栏 ──
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(16)
-
-        self.btn_auto_match = MkButton("自动比对", type="primary")
-        self.btn_auto_match.setToolTip("打开流程画布：配置文件夹与匹配规则，按连接关系执行金额比对关联")
-        self.btn_auto_match.clicked.connect(self._on_auto_match)
-        toolbar.addWidget(self.btn_auto_match)
-
-        toolbar.addStretch()
-
-        # 自动比对进度标签
-        self.lbl_match_progress = QLabel("")
-        self.lbl_match_progress.setStyleSheet(
-            "color: #409eff; font-size: 12px; font-weight: 600;"
-        )
-        toolbar.addWidget(self.lbl_match_progress)
-
-        layout.addLayout(toolbar)
 
         # ── 上半部分：左右双栏文件列表 ──
         self.main_splitter = QSplitter(Qt.Vertical)
@@ -97,26 +75,41 @@ class ComparePage(QWidget):
         self.main_splitter.setCollapsible(1, True)
         layout.addWidget(self.main_splitter, stretch=1)
 
-        # ── 底部关联操作按钮 ──
+        # ── 底部操作按钮：自动比对 + 关联操作（整行居中，进度标签贴最右）──
         btn_bar = QHBoxLayout()
-        btn_bar.setAlignment(Qt.AlignCenter)
         btn_bar.setSpacing(16)
+
+        self.btn_auto_match = MkButton("自动比对", type="primary")
+        self.btn_auto_match.setToolTip("打开流程画布：配置文件夹与匹配规则，按连接关系执行金额比对关联")
+        self.btn_auto_match.clicked.connect(self._on_auto_match)
 
         self.btn_link = MkButton("关联选中项", type="primary")
         self.btn_link.setEnabled(False)
         self.btn_link.clicked.connect(self._on_link)
-        btn_bar.addWidget(self.btn_link)
 
         self.btn_unlink = MkButton("取消关联", type="default")
         self.btn_unlink.setEnabled(False)
         self.btn_unlink.clicked.connect(self._on_unlink)
-        btn_bar.addWidget(self.btn_unlink)
 
         self.btn_rename = MkButton("重命名关联", type="default")
         self.btn_rename.setEnabled(False)
-        self.btn_rename.setToolTip("将关联的发票与支付记录重命名为统一名称")
+        self.btn_rename.setToolTip("将关联的发票与支付记录（或组合）重命名为统一名称")
         self.btn_rename.clicked.connect(self._on_rename)
+
+        # 按钮组整体居中：两侧等量 stretch 包围
+        btn_bar.addStretch(1)
+        btn_bar.addWidget(self.btn_auto_match)
+        btn_bar.addWidget(self.btn_link)
+        btn_bar.addWidget(self.btn_unlink)
         btn_bar.addWidget(self.btn_rename)
+        btn_bar.addStretch(1)
+
+        # 自动比对进度标签：贴按钮行最右侧（保持蓝色小字样式）
+        self.lbl_match_progress = QLabel("")
+        self.lbl_match_progress.setStyleSheet(
+            "color: #409eff; font-size: 12px; font-weight: 600;"
+        )
+        btn_bar.addWidget(self.lbl_match_progress)
 
         layout.addLayout(btn_bar)
 
@@ -195,18 +188,27 @@ class ComparePage(QWidget):
         inv_combo = self.invoice_panel.get_selected_combo()
         pay_combo = self.payment_panel.get_selected_combo()
 
-        both_selected = (inv or inv_combo) is not None and (pay or pay_combo) is not None
+        both_selected = (
+            (inv or inv_combo) is not None and (pay or pay_combo) is not None
+        )
         self.btn_link.setEnabled(both_selected)
 
-        # 取消关联/重命名仅对「单文件↔单文件」生效
+        # 取消关联保持原语义：仅「单文件↔单文件且已关联」
         single_pair = inv is not None and pay is not None
         if single_pair and self.store:
-            linked = self.store.is_linked(inv.file_id, pay.file_id)
-            self.btn_unlink.setEnabled(linked)
-            self.btn_rename.setEnabled(linked)
+            self.btn_unlink.setEnabled(
+                self.store.is_linked(inv.file_id, pay.file_id)
+            )
         else:
             self.btn_unlink.setEnabled(False)
-            self.btn_rename.setEnabled(False)
+
+        # 重命名：两侧均有选中（文件或组合）且两组间存在 >=1 条关联
+        renameable = False
+        if self.store and both_selected:
+            inv_ids = list(inv_combo["file_ids"]) if inv_combo else [inv.file_id]
+            pay_ids = list(pay_combo["file_ids"]) if pay_combo else [pay.file_id]
+            renameable = self.store.group_link_exists(inv_ids, pay_ids)
+        self.btn_rename.setEnabled(renameable)
 
 
     # ── 自动比对 ──────────────────────────────────────────
@@ -310,16 +312,33 @@ class ComparePage(QWidget):
             MkMessage.error(self, "取消关联失败")
 
     def _on_rename(self):
-        """重命名关联文件：将发票与支付记录统一命名。"""
+        """重命名关联文件/组合：把两侧（组合或文件）统一命名。"""
+        if not self.store:
+            return
         inv = self.invoice_panel.get_selected_file()
         pay = self.payment_panel.get_selected_file()
-        if not inv or not pay or not self.store:
-            return
+        inv_combo = self.invoice_panel.get_selected_combo()
+        pay_combo = self.payment_panel.get_selected_combo()
 
-        # 默认名：发票文件名去扩展名
-        default_name = inv.file_name
-        if "." in default_name:
-            default_name = default_name.rsplit(".", 1)[0]
+        inv_ids = list(inv_combo["file_ids"]) if inv_combo else (
+            [inv.file_id] if inv else []
+        )
+        pay_ids = list(pay_combo["file_ids"]) if pay_combo else (
+            [pay.file_id] if pay else []
+        )
+        if not inv_ids or not pay_ids:
+            return
+        combo_ids = [c["combo_id"] for c in (inv_combo, pay_combo) if c]
+
+        # 默认名：选中组合→组合名；否则→发票文件名去扩展名
+        if inv_combo:
+            default_name = inv_combo["name"]
+        elif pay_combo:
+            default_name = pay_combo["name"]
+        else:
+            default_name = inv.file_name
+            if "." in default_name:
+                default_name = default_name.rsplit(".", 1)[0]
 
         new_name, ok = QInputDialog.getText(
             self, "重命名关联文件",
@@ -337,16 +356,22 @@ class ComparePage(QWidget):
         if not new_name:
             return
 
-        result = self.store.rename_linked_files(
-            inv.file_id, pay.file_id, new_name,
-        )
+        names = self.store.rename_group(inv_ids, pay_ids, new_name, combo_ids)
 
-        if result:
-            inv_name, pay_name = result
-            MkMessage.success(
-                self,
-                f"重命名成功！\n发票：{inv_name}\n支付记录：{pay_name}",
-            )
+        if names:
+            if not inv_combo and not pay_combo:
+                MkMessage.success(
+                    self,
+                    f"重命名成功！\n发票：{names[0]}\n支付记录：{names[1]}",
+                )
+            else:
+                preview = "、".join(names[:3])
+                if len(names) > 3:
+                    preview += "…"
+                text = f"已统一重命名 {len(names)} 个文件：{preview}"
+                if combo_ids:
+                    text += f"（组合名同步为 {new_name}）"
+                MkMessage.success(self, text)
             # file_id 已变，旧定位过滤必须先清除，避免重载后变成空结果
             self.invoice_panel.clear_located_files()
             self.payment_panel.clear_located_files()

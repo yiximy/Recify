@@ -510,7 +510,7 @@ class FileListPanel(QWidget):
             f = self._file_by_id(fid)
             if f is None:
                 continue
-            for pid, _ in self._partner_entries(f):
+            for _, pid in self._partner_entries(f):
                 if pid not in partner_ids:
                     partner_ids.append(pid)
         return partner_ids
