@@ -194,3 +194,47 @@
 ### 验证（Claude 独立抽查 9/9 + Codex 几何断言）
 - 日期表项无文本（双层消除）、列为 DateEditCell、高 40/字号 13、日历弹窗 ≥252、列宽 200、日期载入、手动编辑落库 manual、金额/确认列控件在位
 - Codex 几何 JSON 断言全 true（含 line_vs_arrow_disjoint）；`check.sh` 全绿
+
+## 重命名后位置保持 + 列表透气 审查结论（2026-09-28 追加）
+
+**结论：需修（1 高 / 2 中）→ 已派第 2 轮** ｜ 审查人：Claude Code
+
+### 实现（Codex）
+- `store.rename_linked_files`：保序重键（`{new if k == old else k: v}`），重命名条目不再跳到列表末尾
+- 新增 `app/ui/widgets/list_view_state.py`：按「顶层行 index」捕获/恢复（当前行、滚动值、展开项）——重命名会改 file_id，按 id 恢复必然失效
+- `file_list_panel`：`_populate_tree` 末尾恢复视图；`reload_from_store(keep_view=True, advance=False)`；定位栏空闲整行隐藏；行 padding 6→2px
+- `compare_page`：上下改为垂直 QSplitter（初值 420/280 + stretch 3:2、可拖动、列表禁折叠）；`_on_rename` 改走 `reload_from_store(keep_view=True, advance=True)`（不再整目录重扫）
+
+### Claude 独立抽查（自建夹具 24+24 真实文件，19/19 通过）
+- 重命名后发票/支付 index 12→12、列表前缀顺序不变、滚动 300→300、选中 12→13（顺延且钳制）、重命名不增删列表项
+- **1440×920 可视行数 4~5 → 8**（viewport 287 / row_h 33）；1366×768 为 5 行；splitter 实测 426/284（0.60）
+- 定位栏默认隐藏/定位时显示/清除后隐藏；切换文件夹回顶部；查找仍定位；组合重建仍可用
+- 直接修正两处：行 padding 4→2px（省 4px/行，+1 行）、`setSizes([3,2])`（伪比例、实为像素）→ `setSizes([420,280])`
+- 回退 Codex 误改的 `main.py`（仅丢末尾换行）——**提醒：勿动无关文件**
+
+### 第 2 轮修复项（Codex 执行）
+1. **[高] 组合成员重命名后 `combos[*]["file_ids"]` 未更新**（`store.py:322-336` 交叉引用循环只覆盖 linked_*_ids 与 associations；全库仅 combos 遗漏）。后果：成员重命名后脱离组合、组合显示 2 成员只渲染 1、`get_combo_total()` 漏算、自动匹配单元可能重复计入。→ 在同一 old→new 循环里补 combos 重映射。
+2. **[中] 恢复时可能把「隐藏行」设为当前项**（`list_view_state.py:55-62`）：查找过滤命中被重命名文件、或定位过滤仍持旧 file_id 时，该行已隐藏，`setCurrentItem()` 仍会设中并触发 `fileSelected`（预览/按钮指向不可见文件）。→ 目标行 `isHidden()` 时跳过选中断；`advance` 时跳过隐藏行与组合父行（组合父行无 ROLE_FILE_ID，选中后不会发 fileSelected、按钮禁用），并回退到捕获行。
+3. **[中] 重命名后定位过滤失效**：file_id 变了，`_located_file_ids` 里的旧 id 全部失配（面板显示"已定位 0 个关联文件"且行被隐藏）。→ `_on_rename` 成功分支先 `clear_located_files()` 再重载（两侧）。
+4. **[中] 保序重键未防新键冲突**（`store.py:305-320`）：若 `new_id` 已存在（同路径+同秒 mtime 的极小概率），字典推导会静默合并两条记录、丢数据。→ 显式判断：`new_id != old_id and new_id in dict` 时返回 None（宁可失败也不静默损坏）。
+
+### 记录不修（本轮）
+- **[接受] 预览区可被拖到 0**：`setCollapsible(1, True)` 会越过 120px 最小高度——这正是「列表优先」的诉求，属预期行为（拖回即可），`setMinimumHeight(120)` 仅作初始下限。
+- **[既有·待人类拍板] 双文件重命名非原子**：`store.py:284-291` 第一段 `os.rename` 成功后第二段失败即 `return None`，磁盘已改而 Store 未改（下次扫描标 missing、可能丢关联）。非本次引入 → 记入 backlog。
+
+### 第 2 轮复审结论（2026-09-28 追加）：通过 ✅
+
+Codex 第 2 轮只改 3 个允许文件（store.py / list_view_state.py / compare_page.py），逐条核对：
+
+| 修复项 | 实现核对 | Claude 独立抽查 |
+|---|---|---|
+| 组合成员重映射 | `store.py` 在 old→new 循环内补 `combos[*].file_ids` 替换（`_data.get("combos", [])` 防御式） | ✅ 成员换成新 id、旧 id 不残留、组合仍 2 成员、get_combo_total 不漏算、index 3→3、滚动 76→76 |
+| 隐藏行/组合父行 | `list_view_state._is_visible_file_item`（未隐藏 + 序号列带 file_id）；advance 向后找文件行、找不到回退捕获行 | ✅ 顺延落点 INV_05.pdf（跳过组合父行）；查找过滤下重命名后 `currentItem()=None`、`selectedItems()=[]` |
+| 定位过滤失效 | `_on_rename` 成功分支先 `clear_located_files()` 两侧再重载 | ✅ `_located_file_ids` 清空、定位栏隐藏、列表 12 行完整、当前项可见 |
+| 重键冲突保护 | 冲突判断移到**磁盘重命名之前**（这点很关键：被拒的请求不应改盘） | ✅ 注入同 id 条目后返回 None、记录数 4→4 不变、原文件仍在磁盘、目标新文件未创建 |
+
+- Claude 另修 2 处：① `set_located_files` 只在进入定位视图（file_ids 非空）时清空查找词 —— 否则本轮新加的 `clear_located_files()` 会连用户搜索词一起吞掉（`清除` 按钮语义也更正确）；② `_is_visible_file_item` 补注释说明 ROLE_FILE_ID(=UserRole) 的取值耦合。
+- **独立抽查合计 39/39 通过**（第 1 轮 19 + 第 2 轮 20），`check.sh` 全绿。
+- Codex 第 2 轮 `git status` 干净（未再触碰 main.py）；上一轮误改的 main.py 末尾换行已由 Claude 回退。
+
+**遗留（已记入 backlog）**：双文件重命名非原子（P2，既有问题，待人类拍板）；file_list_panel.py 1020 行、store.py 923 行超 800 约束（P3）；分隔条位置未持久化（P3）。
