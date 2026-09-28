@@ -161,3 +161,20 @@
 ### 验证
 - 独立抽查 6/6 + 金额页 4 项断言全过；`check.sh` 全绿
 - 审查备注：本次我两次断言脚本自身写错（夹具日期超 7 天致空画布、列索引读错 2/3 应为 3/4），实现均正确——沿用此前教训：夹具须模拟真实数据分布
+
+## 金额页日期手动编辑 审查结论（2026-09-28 追加）
+
+**结论：通过 ✅**（已按规则提交推送）
+
+### 实现
+- 新增 `date_edit_cell.py`（DateEditCell）：QDateEdit + 日历弹出 + 「未设置」空值语义（specialValueText + minimumDate=1900-01-01）+ 清除按钮 + committed(file_id, date_iso|"")；_building 防抖、_last_committed 去重、set_readonly；样式与金额编辑单元格范式一致
+- amount_page：日期列 setCellWidget 承载 DateEditCell（_date_cells 缓存复用）；提交 → `source="manual"`，清除 → 空值空来源
+- **OCR 不覆盖手动**：`_persist_ocr_document_date` 先查 source=="manual" 直接返回（手动修正优先）
+- 显示联动：比对页 `_set_date_cell` 支持 manual（tooltip「手动设置」）；preview_panel 标注扩展「票面/手动/文件」
+
+### 验证（Claude 独立抽查 8 项全过 + Codex 断言）
+- 单元格放置、OCR 日期载入、空显示「未设置」、手动设置落库 manual、**OCR 不覆盖手动、非手动文件 OCR 正常更新**、清除落空、比对页 manual 显示与标注
+- `check.sh` 全绿；回归（金额编辑/确认列、列索引）通过
+
+### 遗留
+- 真机复验：日期控件视觉、170px 列宽、日历弹窗在真实桌面的表现

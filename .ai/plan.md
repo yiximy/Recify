@@ -593,3 +593,13 @@ def _on_confirm():
 - `NodeConfigDialog` 保存匹配模块时回写 node.params，并同步 `AppConfig.set(...)` 后 `save()`。
 - `AmountPage` 表格列调整为“文件名 / 日期 / 识别金额 / 编辑金额 / 确认”；日期仅展示 `get_document_date(..., source="ocr")`，否则显示灰色 `—`，OCR 完成与页面刷新时同步更新。
 - 使用临时 config/store 的离屏脚本覆盖持久化、自动铺参数、新建模块 params、日期展示、OCR 回填和编辑/确认列索引；清理后运行 `scripts/check.sh`。
+
+---
+
+## 2026-09-28 实现方案：金额页日期列可手动编辑
+
+- 新增 `DateEditCell`：`QDateEdit` 日历弹出、`1900-01-01 + 未设置` 空值哨兵、清除按钮、`committed(file_id, date_iso)`。
+- `AmountPage` 日期列改由 `setCellWidget(row, 1)` 承载控件，按文件 ID 刷新；手动设置写 `manual`，清除写空值与空源。
+- OCR 日期落库前检查现有条目来源，`manual` 时直接保留；其他来源按原逻辑写入 `ocr`。
+- `FileListPanel` 与 `MatchFlowPreviewPanel` 扩展 `manual` 来源显示和 tooltip/标注。
+- 使用临时 Store、离屏 Qt 覆盖控件落库/清除/重载、OCR 防覆盖、三处显示及金额/确认/列索引回归，再运行统一检查。
