@@ -22,6 +22,7 @@ from app.core.date_parser import parse_date_from_lines
 from app.core.file_scanner import FileScanner
 from app.ui.widgets.amount_edit_cell import AmountEditCell
 from app.ui.widgets.confirm_checkbox import ConfirmCheckBox
+from app.ui.widgets.date_edit_cell import DateEditCell
 from app.ui.widgets.folder_picker import FolderPicker
 from app.ui.widgets.preview_view import PreviewView
 from app.ui.widgets.table_utils import enable_smooth_scroll
@@ -35,7 +36,7 @@ LOW_CONFIDENCE = 0.8
 ROW_HEIGHT = 46
 
 # 日期列宽：容纳 YYYY-MM-DD 或占位符
-DATE_COL_WIDTH = 110
+DATE_COL_WIDTH = 170
 # 编辑金额列宽：足以完整显示较大金额（含 "99999999.99" 级别）
 EDIT_COL_WIDTH = 180
 # 确认列宽：仅放一个居中复选框
@@ -86,6 +87,8 @@ class AmountPage(QWidget):
         self._path_to_fid: dict = {}
         # file_id → AmountEditCell
         self._edit_cells: dict = {}
+        # file_id → DateEditCell
+        self._date_cells: dict = {}
         # file_id → MkCheckBox
         self._confirm_checks: dict = {}
 
@@ -554,6 +557,7 @@ class AmountPage(QWidget):
         self.table.setRowCount(0)
         self._fid_to_row.clear()
         self._edit_cells.clear()
+        self._date_cells.clear()
         self._confirm_checks.clear()
 
         if not self._filtered_files:
@@ -605,30 +609,33 @@ class AmountPage(QWidget):
             wl.setAlignment(Qt.AlignCenter)
             self.table.setCellWidget(row_idx, 4, wrap)
 
-            row_h = max(ROW_HEIGHT, edit_cell.sizeHint().height() + 4)
+            row_h = max(
+                ROW_HEIGHT,
+                edit_cell.sizeHint().height() + 4,
+                self._date_cells[f.file_id].sizeHint().height() + 4,
+            )
             self.table.setRowHeight(row_idx, row_h)
 
         self._configure_columns()
         self._suppress = False
 
     def _get_date_display(self, file) -> tuple[str, bool]:
-        """返回日期显示文本及是否为未识别占位。"""
-        if not self.store:
-            return "—", True
-        date_iso, source = self.store.get_document_date(file)
-        if source == "ocr" and date_iso:
-            return date_iso, False
-        return "—", True
+        """返回原始 document_date；未设置时不使用文件时间回退。"""
+        date_iso = str(getattr(file, "document_date", "") or "").strip()
+        return (date_iso, False) if date_iso else ("未设置", True)
 
     def _set_date_cell(self, row_idx: int, file) -> None:
-        """按 OCR 日期刷新日期列；未识别保持灰色占位符。"""
-        item = self.table.item(row_idx, 1)
-        if item is None:
-            return
+        """在日期列放置或刷新 DateEditCell。"""
         text, placeholder = self._get_date_display(file)
-        item.setText(text)
-        item.setToolTip(text)
-        item.setForeground(QColor("#c0c4cc" if placeholder else "#303133"))
+        date_iso = "" if placeholder else text
+        cell = self._date_cells.get(file.file_id)
+        if cell is None:
+            cell = DateEditCell(file.file_id, date_iso)
+            cell.committed.connect(self._on_date_committed)
+            self._date_cells[file.file_id] = cell
+        else:
+            cell.set_date(date_iso)
+        self.table.setCellWidget(row_idx, 1, cell)
 
     def _refresh_date_cell(self, row_idx: int, file_id: str) -> None:
         """从 Store 重新读取单文件日期并刷新可见行。"""
@@ -755,13 +762,19 @@ class AmountPage(QWidget):
         self.lbl_status.setText(f"({current}/{total}) {message}")
 
     def _persist_ocr_document_date(self, file_id: str, raw_texts: list[str]) -> None:
-        """解析 OCR 日期并落库；解析失败保持原值，不影响金额流程。"""
+        """解析 OCR 日期并落库；手动日期优先，解析失败保持原值。"""
         if not self.store:
+            return
+        kind = "payments" if self._file_type == "image" else "invoices"
+        getter = self.store.get_payment if self._file_type == "image" \
+            else self.store.get_invoice
+        current = getter(file_id)
+        if current is not None and \
+                getattr(current, "document_date_source", "") == "manual":
             return
         document_date = parse_date_from_lines(raw_texts)
         if not document_date:
             return
-        kind = "payments" if self._file_type == "image" else "invoices"
         self.store.set_document_date(kind, file_id, document_date, "ocr")
 
     def _on_ocr_finished(self, result_map: dict):
@@ -846,6 +859,16 @@ class AmountPage(QWidget):
         self._update_summary()
 
     # ── 编辑与确认 ──────────────────────────────────────────
+
+    def _on_date_committed(self, file_id: str, date_iso: str) -> None:
+        """日期编辑提交：手动日期写 manual，清除写空值和空来源。"""
+        if self._suppress or not self.store:
+            return
+        kind = "payments" if self._file_type == "image" else "invoices"
+        if date_iso:
+            self.store.set_document_date(kind, file_id, date_iso, "manual")
+        else:
+            self.store.set_document_date(kind, file_id, "", "")
 
     def _on_amount_committed(self, file_id: str, value):
         """金额编辑提交。"""

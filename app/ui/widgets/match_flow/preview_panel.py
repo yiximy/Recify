@@ -252,7 +252,11 @@ class MatchFlowPreviewPanel(QFrame):
     def _add_file_item(self, file: PreviewFile) -> None:
         label = file.name
         if file.date_iso:
-            source_label = "票面" if file.date_source == "ocr" else "文件"
+            source_label = {
+                "ocr": "票面",
+                "manual": "手动",
+                "file": "文件",
+            }.get(file.date_source, "票面")
             label += f" · {file.date_iso}（{source_label}）"
         if file.combo_name:
             label += f"  ·  组合「{file.combo_name}」"

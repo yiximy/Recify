@@ -422,14 +422,19 @@ class FileListPanel(QWidget):
         return item
 
     def _set_date_cell(self, item: QTreeWidgetItem, f) -> None:
-        """日期列：优先票面日期（OCR），未识别到时回退显示文件修改时间。"""
+        """日期列：优先票面/手动日期，未设置时回退文件修改时间。"""
         if self.store is not None:
             date_iso, source = self.store.get_document_date(f)
         else:
             date_iso, source = "", ""
-        if date_iso and source == "ocr":
+        if date_iso and source != "file":
             item.setText(COL_DATE, _format_date(date_iso))
-            item.setToolTip(COL_DATE, "票面日期（OCR 识别）")
+            tooltip = (
+                "手动设置"
+                if source == "manual"
+                else "票面日期（OCR 识别）"
+            )
+            item.setToolTip(COL_DATE, tooltip)
         else:
             item.setText(COL_DATE, _format_date(getattr(f, "modified_iso", "")))
             item.setToolTip(COL_DATE, "文件修改时间（未识别到票面日期）")
