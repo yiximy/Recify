@@ -1,45 +1,24 @@
-# 任务简报：金额页日期列可手动编辑
+# 任务简报：金额页日期列 显示重叠 + 选择器放大
 
-## 需求（人类 2026-09-28）
+## 问题（人类 2026-09-28 真机反馈）
 
-「计算金额模式」中，文件的日期需要**可手动修改**——有些日期识别错误或没有日期，需要人工修正。
+1. **日期字体重叠**：计算金额模式中，发票文件一列的日期文字出现重叠（视觉挤压）
+2. **日期选择器太小不好用**：内嵌 QDateEdit 与弹窗都偏小，点选困难
 
-## 规格
+## 修复方向
 
-### 1. 新控件 `app/ui/widgets/date_edit_cell.py`：DateEditCell
+### 1. 定位重叠根因（先实证再改）
+- 离屏 grab `DateEditCell`（含"未设置"与正常日期两种态）→ 像素/几何分析：文本绘制区与日历下拉按钮/清除按钮是否重叠；`DATE_COL_WIDTH` 当前值是否不足；Qt 样式下 `specialValueText` 与 drop-down 的布局挤压
+- 汇报根因后修复（预计：列宽不足 + QDateEdit 文本区未给 drop-down 留 padding）
 
-- 复用「编辑金额」列（`amount_edit_cell.py`）的交互范式：内嵌控件 + `committed` 信号（值：`YYYY-MM-DD` 或 `""` 表示清除）
-- 用 **QDateEdit**（日历弹出，`setCalendarPopup(True)`）；**空值表示**：用 `setSpecialValueText("未设置")` + `minimumDate(=1900-01-01)` 双重语义——显示"未设置"即无日期；另给「清除」按钮（清空 → 提交空值）
-- 载入时：有日期 → 设置该日期；无 → 显示"未设置"
-- 视觉与金额编辑单元格一致（无边框/透明背景、聚焦时高亮）
-- 日期口径：仅日期（无时间）
+### 2. 放大与易用性（含具体参数，可按实测微调）
+- `DateEditCell`：QDateEdit 高度 36→**40**、字号显式 **13px**、文本左 padding 加大、drop-down 宽度 ≥ **26px**（样式 `QDateEdit::drop-down`）；清除按钮高度同步、宽度略增
+- `amount_page`：`DATE_COL_WIDTH` 增加到 **190~210**（保证 日期文本 + 下拉按钮 + 清除按钮 三者不挤压）
+- **日历弹窗放大**：为 QDateEdit 的 calendarPopup 设置 QCalendarWidget 样式（导航栏高度、星期/日期单元格 `min-width:30px; min-height:28px`、字号 13px、选中/今天高亮沿用 Elegant Light 蓝），使弹窗明显大于默认
+- 若实测发现 QDateEdit 弹出日历放大受限明显、体验仍差 → 备选方案「点击单元格弹出独立大日历对话框（QCalendarWidget 放大 + 今天/清除/确定）」，在汇报中给建议与取舍，不擅自切换
 
-### 2. 源语义扩展：`source="manual"`
-
-- 手动设置 → `store.set_document_date(kind, fid, date_iso, "manual")`
-- **清除** → `set_document_date(kind, fid, "", "")`（空值回退文件修改时间，引擎语义不变）
-
-### 3. 联动显示（manual 与 ocr 同等对待）
-
-- `amount_page` 日期列：改为承载 DateEditCell（`setCellWidget(行, 1)`）；显示规则改为「有 document_date（ocr 或 manual）→ 显示日期；否则 —」
-- `file_list_panel`（比对页）`_set_date_cell`：判定改为「`document_date` 非空」即显示票面/手动日期（不再只认 `source=="ocr"`）；tooltip 区分来源：`票面日期（OCR 识别）` / `手动设置` / 回退时 `文件修改时间（未识别到票面日期）`
-- `preview_panel` 标注：`（票面）`/`（手动）`/`（文件）`（当前仅票面/文件两态）
-
-### 4. OCR 不覆盖手动日期（重要）
-
-- `amount_page._persist_ocr_document_date`：仅当当前条目 `document_date_source != "manual"` 时才写入 OCR 日期（手动修正优先，重跑识别不丢失）
-- merge 重扫保留逻辑无需改（已有 document_date 即保留）
-
-## 相关文件
-
-- 新增 `app/ui/widgets/date_edit_cell.py`
-- `app/ui/pages/amount_page.py`（日期列控件化/显示规则/OCR 不覆盖）
-- `app/ui/widgets/file_list_panel.py`、`app/ui/widgets/match_flow/preview_panel.py`（来源显示扩展）
-
-## 验证要求（Codex）
-
-1. 控件：设置日期 → store 落库 `source="manual"`；清除 → 落空且界面显示"未设置"；重新载入表格显示正确
-2. 不覆盖：先手动设置日期，再模拟 OCR 完成写入 ocr 日期 → store 中仍为手动值与 `manual` 来源；未手动过的文件 OCR 正常写入
-3. 联动：比对页与预览面板对 manual 来源显示日期与对应 tooltip/标注
-4. 回归：金额编辑/确认列交互、表格列索引（日期列现在是控件）、比对页日期列、`D:/Using_small_tools/Git/bin/bash.exe scripts/check.sh` 全绿
-5. 离屏脚本 exec/sys.exit 退出；临时脚本用后清理；不新增依赖；不改用户数据（测试用临时 store/config）；不 commit（Claude 审查后按规则提交）
+### 3. 验证要求
+- 离屏 grab：修复前后各一张日期单元格截图（正常日期 + 未设置），以及日历弹窗放大后截图（`_tmp_diag/` 留存供审）
+- 几何断言：QDateEdit 文本显示区与 drop-down/清除按钮矩形不相交；列宽 ≥ 文本宽 + 按钮宽
+- 回归：日期手动编辑/清除/OCR 覆盖保护逻辑不变；金额编辑/确认列交互正常；`check.sh` 全绿
+- 离屏脚本 exec/sys.exit 退出；临时脚本用后清理；不新增依赖；不改用户数据；不 commit（Claude 审查后按规则提交）
