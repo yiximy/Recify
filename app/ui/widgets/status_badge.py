@@ -21,36 +21,60 @@ class StatusBadge(QWidget):
         badge.set_linked(True, count=2, auto=True) # 自动关联
     """
 
+    # 有效关联数与失效提示同时出现时需要的宽度（如「已关联 2 ⚠1」）
+    _WIDTH = 96
+    _HEIGHT = 24
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._linked = False
         self._auto = False
+        self._dangling = 0
         self._text = "未关联"
-        self.setFixedSize(78, 24)
+        self.setFixedSize(self._WIDTH, self._HEIGHT)
 
-    def set_linked(self, linked: bool, count: int = 0, auto: bool = False):
+    def set_linked(self, linked: bool, count: int = 0, auto: bool = False,
+                   dangling: int = 0):
         """设置关联状态。
 
         Args:
-            linked: 是否已关联
-            count: 关联数量（>0 时显示数量）
+            linked: 是否存在**有效**关联（对象记录存在且非 missing）
+            count: 有效关联数量（只要已关联就显示具体条数）
             auto: 是否为自动关联（与手动关联视觉区分）
+            dangling: 失效关联条数（对象已删除/已 missing）；>0 时以警示色
+                追加「⚠N」，让用户一眼看到仍有失效关联需要清理
         """
         self._linked = linked
         self._auto = auto
+        self._dangling = max(0, int(dangling or 0))
         if linked:
             prefix = "自动" if auto else "已关联"
-            self._text = f"{prefix} {count}" if count > 1 else prefix
+            self._text = f"{prefix} {count}"
+            if self._dangling:
+                self._text += f" ⚠{self._dangling}"
+        elif self._dangling:
+            # 全部关联都已失效：明确标出失效条数（不再是「未关联」）
+            self._text = f"失效 {self._dangling}"
         else:
             self._text = "未关联"
         self.update()
+
+    @property
+    def text(self) -> str:
+        """当前徽标文本（只读，供单测/调试断言）。"""
+        return self._text
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self.rect().adjusted(2, 2, -2, -2)
 
-        if self._linked and self._auto:
+        if self._dangling:
+            # 存在失效关联：警示黄（优先级最高，提示需要清理）
+            bg = QColor("#fff8e1")
+            fg = QColor("#b45309")
+            border = QColor("#ffe082")
+        elif self._linked and self._auto:
             # 自动关联：蓝色调，虚线边框区分于手动关联
             bg = QColor("#e8f4fd")
             fg = QColor("#1565c0")
@@ -66,7 +90,7 @@ class StatusBadge(QWidget):
 
         painter.setBrush(bg)
 
-        if self._linked and self._auto:
+        if self._linked and self._auto and not self._dangling:
             # 自动关联使用虚线描边
             pen = QPen(border)
             pen.setStyle(Qt.PenStyle.DashLine)

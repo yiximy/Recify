@@ -2,14 +2,17 @@
 """比对关联页：左右双栏文件列表 + 双预览区 + 关联操作 + 自动比对"""
 from __future__ import annotations
 
+from datetime import datetime
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QInputDialog,
-    QDialog,
+    QDialog, QFileDialog,
 )
 from monkeyqt import MkButton, MkMessage
 
+from app.core.excel_export import build_association_rows, write_xlsx
 from app.ui.widgets.file_list_panel import FileListPanel
 from app.ui.widgets.match_flow_dialog import MatchFlowDialog
 from app.ui.widgets.preview_view import PreviewView
@@ -96,12 +99,17 @@ class ComparePage(QWidget):
         self.btn_rename.setToolTip("将关联的发票与支付记录（或组合）重命名为统一名称")
         self.btn_rename.clicked.connect(self._on_rename)
 
+        self.btn_export = MkButton("导出 Excel", type="default")
+        self.btn_export.setToolTip("把有效关联（发票 ↔ 支付记录）导出为 .xlsx 表格")
+        self.btn_export.clicked.connect(self._on_export_excel)
+
         # 按钮组整体居中：两侧等量 stretch 包围
         btn_bar.addStretch(1)
         btn_bar.addWidget(self.btn_auto_match)
         btn_bar.addWidget(self.btn_link)
         btn_bar.addWidget(self.btn_unlink)
         btn_bar.addWidget(self.btn_rename)
+        btn_bar.addWidget(self.btn_export)
         btn_bar.addStretch(1)
 
         # 自动比对进度标签：贴按钮行最右侧（保持蓝色小字样式）
@@ -386,6 +394,26 @@ class ComparePage(QWidget):
             MkMessage.error(
                 self, "重命名失败，可能目标文件已存在或文件被占用。"
             )
+
+    def _on_export_excel(self):
+        """导出有效关联为 Excel：UI 只负责取路径与提示，逻辑全在 core。"""
+        if not self.store:
+            return
+        default_name = f"关联信息_{datetime.now():%Y%m%d}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出关联信息", default_name, "Excel 文件 (*.xlsx)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            rows = build_association_rows(self.store)
+            write_xlsx(path, rows)
+        except OSError as exc:
+            MkMessage.error(self, f"导出失败：{exc}")
+            return
+        MkMessage.success(self, f"已导出 {len(rows) - 1} 条关联到\n{path}")
 
     def _on_combos_changed(self):
         """组合增删后：两侧面板重建树（保持层级与金额最新）。"""

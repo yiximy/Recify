@@ -16,6 +16,7 @@ from .models import (
 from .rename_plan import (
     has_target_conflict, plan_target_paths, remap_dict_keys, rename_paths,
 )
+from .file_identity import plan_rename_adoptions
 
 
 class Store:
@@ -33,6 +34,8 @@ class Store:
         self._data: dict = self._load()
         # 数据变更回调列表（UI 层可注册刷新）
         self._listeners: list = []
+        # 最近一次 merge 的改名自愈结果：[(旧文件名, 新文件名), ...]，供 UI 提示
+        self.last_rename_adoptions: list[tuple[str, str]] = []
 
     # ── 持久化 ──────────────────────────────────────────────
 
@@ -114,6 +117,7 @@ class Store:
         with self._lock:
             existing = self._data["invoices"]
             new_ids = {inv.file_id for inv in scanned}
+            self.last_rename_adoptions = []
             # 标记缺失文件
             if mark_missing:
                 # True（默认）= 替换语义：本次未扫到的同类型文件全部标 missing
@@ -128,6 +132,8 @@ class Store:
                     if fid not in new_ids and inv_dict.get("abs_path") \
                             and self._dir_key(inv_dict["abs_path"]) in scanned_dirs:
                         inv_dict["missing"] = True
+            # 改名自愈规划：此刻新记录尚未写入 existing，可据 id 差异识别
+            rename_plan = plan_rename_adoptions(scanned, existing)
             # 合并新扫描结果（保留 linked_payment_ids）
             for inv in scanned:
                 if inv.file_id in existing:
@@ -138,6 +144,8 @@ class Store:
                         inv.document_date = old.get("document_date", "")
                         inv.document_date_source = old.get("document_date_source", "")
                 existing[inv.file_id] = inv.to_dict()
+            # 改名自愈落地：接管金额/日期/关联并重映射交叉引用
+            self._adopt_renamed("invoices", "linked_payment_ids", rename_plan)
             # 重扫后清理「成员全部缺失/不存在」的空壳发票组合（保留部分缺失组合）
             self._prune_shell_combos("invoice")
             self._save()
@@ -153,6 +161,7 @@ class Store:
         with self._lock:
             existing = self._data["payments"]
             new_ids = {pay.file_id for pay in scanned}
+            self.last_rename_adoptions = []
             if mark_missing:
                 # True（默认）= 替换语义
                 for fid, pay_dict in existing.items():
@@ -165,6 +174,8 @@ class Store:
                     if fid not in new_ids and pay_dict.get("abs_path") \
                             and self._dir_key(pay_dict["abs_path"]) in scanned_dirs:
                         pay_dict["missing"] = True
+            # 改名自愈规划：此刻新记录尚未写入 existing，可据 id 差异识别
+            rename_plan = plan_rename_adoptions(scanned, existing)
             for pay in scanned:
                 if pay.file_id in existing:
                     old = existing[pay.file_id]
@@ -174,10 +185,41 @@ class Store:
                         pay.document_date = old.get("document_date", "")
                         pay.document_date_source = old.get("document_date_source", "")
                 existing[pay.file_id] = pay.to_dict()
+            # 改名自愈落地：接管金额/日期/关联并重映射交叉引用
+            self._adopt_renamed("payments", "linked_invoice_ids", rename_plan)
             # 重扫后清理「成员全部缺失/不存在」的空壳支付组合（保留部分缺失组合）
             self._prune_shell_combos("payment")
             self._save()
             self._notify()
+
+    def _adopt_renamed(self, data_key: str, link_key: str,
+                       plan: list[tuple[str, str]]):
+        """改名自愈落地：把 missing 旧记录的身份接管给被识别的新记录。
+
+        对每条 ``(旧 id, 新 id)`` 配对：新记录继承 OCR 金额、票面/手动日期与
+        关联列表；删除旧 missing 记录（避免被后续文件重复认领）；最后统一
+        重映射交叉引用（linked_*_ids / associations / combos.file_ids）。
+        记录 (旧名, 新名) 到 ``last_rename_adoptions`` 供 UI 提示。
+        """
+        if not plan:
+            return
+        existing = self._data[data_key]
+        old_to_new = dict(plan)
+        for old_id, new_id in plan:
+            old = existing.get(old_id)
+            new = existing.get(new_id)
+            if old is None or new is None:
+                continue
+            new["amount"] = old.get("amount", AmountRecord().to_dict())
+            new[link_key] = list(old.get(link_key, []))
+            if old.get("document_date"):
+                new["document_date"] = old["document_date"]
+                new["document_date_source"] = old.get("document_date_source", "")
+            self.last_rename_adoptions.append(
+                (old.get("file_name", ""), new.get("file_name", ""))
+            )
+            del existing[old_id]
+        self._remap_file_ids(old_to_new)
 
     # ── 查询 ────────────────────────────────────────────────
 
@@ -260,6 +302,57 @@ class Store:
         with self._lock:
             inv = self._data["invoices"].get(invoice_id)
             return bool(inv and payment_id in inv.get("linked_payment_ids", []))
+
+    def prune_dangling_links(self, file_id: str) -> int:
+        """清理该文件指向「记录不存在 / missing」对象的失效关联，返回条数。
+
+        只处理该文件自身一侧的 ``linked_*_ids`` 与对应 ``associations`` 冗余
+        条目，不改动对方记录（不静默丢数据、不越权修改无关记录）。
+        选择「按文件」而非「按 kind 全局」的理由：右键入口天然是单文件语义，
+        作用域最小、可解释；全局清理会一次性改动用户未主动触发的数据。
+        """
+        with self._lock:
+            removed = 0
+            for data_key, link_key, partner_key in (
+                ("invoices", "linked_payment_ids", "payments"),
+                ("payments", "linked_invoice_ids", "invoices"),
+            ):
+                entry = self._data[data_key].get(file_id)
+                if entry is None:
+                    continue
+                valid: list[str] = []
+                dangling: set[str] = set()
+                for partner_id in list(entry.get(link_key, [])):
+                    partner = self._data[partner_key].get(partner_id)
+                    if partner is not None and not partner.get("missing"):
+                        valid.append(partner_id)
+                    else:
+                        dangling.add(partner_id)
+                        removed += 1
+                if not dangling:
+                    continue
+                entry[link_key] = valid
+                if data_key == "invoices":
+                    self._data["associations"] = [
+                        a for a in self._data["associations"]
+                        if not (a["invoice_id"] == file_id
+                                and a["payment_id"] in dangling)
+                    ]
+                else:
+                    self._data["associations"] = [
+                        a for a in self._data["associations"]
+                        if not (a["payment_id"] == file_id
+                                and a["invoice_id"] in dangling)
+                    ]
+            if removed:
+                self._save()
+                self._notify()
+            return removed
+
+    def get_associations(self) -> list[dict]:
+        """获取关联表副本（供导出等只读消费，避免外部误改内部数据）。"""
+        with self._lock:
+            return [dict(a) for a in self._data.get("associations", [])]
 
     def rename_group(self, invoice_ids: list[str], payment_ids: list[str],
                      new_base: str,

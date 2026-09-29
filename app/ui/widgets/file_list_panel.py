@@ -41,7 +41,7 @@ COL_AMOUNT = 2    # 金额
 COL_DATE = 3      # 日期（优先票面日期，回退文件修改时间）
 COL_STATUS = 4    # 状态徽标
 
-STATUS_COL_WIDTH = 84
+STATUS_COL_WIDTH = 100   # 容纳「已关联 2 ⚠1」等失效提示
 
 # QTreeWidgetItem 自定义数据角色
 ROLE_FILE_ID = Qt.ItemDataRole.UserRole            # 该行对应文件 id（子行存父文件 id）
@@ -334,6 +334,7 @@ class FileListPanel(QWidget):
         else:
             files = FileScanner.scan_payments(folder)
 
+        adopted: list[tuple[str, str]] = []
         # 合并到 Store
         if self.store:
             if self.kind == "invoice":
@@ -342,9 +343,21 @@ class FileListPanel(QWidget):
             else:
                 self.store.merge_payments(files)
                 files = self.store.get_payments()
+            # 改名自愈结果（Store 内存字段），用于提示外部改名已被自动识别
+            adopted = list(getattr(self.store, "last_rename_adoptions", []) or [])
 
         self._files = files
         self._populate_tree(files)
+        if adopted:
+            self._notify_rename_adoptions(adopted)
+
+    def _notify_rename_adoptions(self, adopted: list[tuple[str, str]]):
+        """提示本次重扫自动识别的改名文件（改名自愈结果）。"""
+        preview = "、".join(f"{old} → {new}" for old, new in adopted[:3])
+        suffix = "…" if len(adopted) > 3 else ""
+        MkMessage.success(
+            self, f"已自动识别 {len(adopted)} 个改名文件：{preview}{suffix}"
+        )
 
     # ── 树填充 ──────────────────────────────────────────────
 
@@ -534,36 +547,61 @@ class FileListPanel(QWidget):
     def _attach_badge(self, item: QTreeWidgetItem, f):
         """在状态列放置关联徽标 widget。"""
         badge = StatusBadge()
-        linked, count, auto = self._link_state(f)
-        badge.set_linked(linked, count, auto=auto)
+        linked, count, auto, dangling = self._link_state(f)
+        badge.set_linked(linked, count, auto=auto, dangling=dangling)
+        badge.setToolTip(self._link_tooltip(count, dangling))
         self.tree.setItemWidget(item, COL_STATUS, badge)
 
-    def _link_state(self, f) -> tuple[bool, int, bool]:
-        """返回 (是否已关联, 关联数量, 是否全部为自动关联)。
+    @staticmethod
+    def _link_tooltip(count: int, dangling: int) -> str:
+        """徽标 tooltip：有效条数 + 失效条数（失效提示清理入口）。"""
+        parts = [f"有效关联 {count} 条"]
+        if dangling:
+            parts.append(f"失效 {dangling} 条（右键「清理失效关联」）")
+        return "；".join(parts)
 
-        若任一关联非自动，则视为手动关联（手动关联优先级高于自动关联）。
+    def _link_state(self, f) -> tuple[bool, int, bool, int]:
+        """返回 (是否存在有效关联, 有效关联数, 是否全自动, 失效关联数)。
+
+        有效 = 对象记录存在且 ``missing == False``；对象记录不存在或已 missing
+        即视为失效。失效条数不计入关联数（避免「2 有效 + 1 失效 = 已关联 3」），
+        但单独返回供徽标/清理入口提示。若任一有效关联非自动，则为手动关联。
         """
         if self.kind == "invoice":
-            partner_ids = getattr(f, "linked_payment_ids", [])
+            partner_ids = list(getattr(f, "linked_payment_ids", []) or [])
         else:
-            partner_ids = getattr(f, "linked_invoice_ids", [])
+            partner_ids = list(getattr(f, "linked_invoice_ids", []) or [])
 
         if not partner_ids:
-            return False, 0, False
+            return False, 0, False, 0
 
-        # 检查是否全部为自动关联
+        valid: list[str] = []
+        dangling = 0
+        for pid in partner_ids:
+            partner = None
+            if self.store:
+                partner = (self.store.get_payment(pid)
+                           if self.kind == "invoice"
+                           else self.store.get_invoice(pid))
+            if partner is not None and not partner.missing:
+                valid.append(pid)
+            else:
+                dangling += 1
+
+        if not valid:
+            return False, 0, False, dangling
+
         all_auto = True
-        if self.store:
-            for pid in partner_ids:
-                if self.kind == "invoice":
-                    auto = self.store.is_auto_linked(f.file_id, pid)
-                else:
-                    auto = self.store.is_auto_linked(pid, f.file_id)
-                if not auto:
-                    all_auto = False
-                    break
+        for pid in valid:
+            if self.kind == "invoice":
+                auto = self.store.is_auto_linked(f.file_id, pid)
+            else:
+                auto = self.store.is_auto_linked(pid, f.file_id)
+            if not auto:
+                all_auto = False
+                break
 
-        return True, len(partner_ids), all_auto
+        return True, len(valid), all_auto, dangling
 
     def _partner_entries(self, f) -> list[tuple[str, str]]:
         """返回该文件已关联对象的 (文件名, file_id)，跳过磁盘已删除对象。"""
@@ -827,11 +865,14 @@ class FileListPanel(QWidget):
         else:
             unlink_files = [file_obj]
         has_partner = any(self._partner_entries(f) for f in unlink_files)
+        dangling_total = sum(self._link_state(f)[3] for f in unlink_files)
 
         partner_ids = [pid for _, pid in self._partner_entries(file_obj)]
 
         menu = QMenu(self.tree)
         menu.setStyleSheet(_MENU_QSS)
+        # 单文件（含组合成员）可应用内改名：组合身份/关联/金额/日期全部保留
+        act_rename = menu.addAction("重命名") if not multi else None
         act_combo = menu.addAction("组合") if multi_files else None
         act_locate_all = None
         act_unlink_all = None
@@ -839,10 +880,15 @@ class FileListPanel(QWidget):
             act_locate_all = menu.addAction("定位所有")
         if has_partner:
             act_unlink_all = menu.addAction("取消所有关联")
+        act_prune = None
+        if dangling_total:
+            act_prune = menu.addAction("清理失效关联")
         if not menu.actions():
             return
         selected_action = menu.exec(self.tree.viewport().mapToGlobal(pos))
-        if selected_action is act_combo:
+        if selected_action is act_rename:
+            self._on_rename_file(file_obj)
+        elif selected_action is act_combo:
             self._on_create_combo(
                 [i.data(COL_SEQ, ROLE_FILE_ID) for i in top_files]
             )
@@ -853,6 +899,8 @@ class FileListPanel(QWidget):
                 self._on_unlink_all_files(unlink_files)
             else:
                 self._on_unlink_all(file_obj, partner_ids)
+        elif selected_action is act_prune:
+            self._on_prune_dangling(unlink_files)
 
     # ── 组合/取消关联 操作 ────────────────────────────────
 
@@ -902,6 +950,47 @@ class FileListPanel(QWidget):
         self.store.delete_combo(combo["combo_id"])
         self.combosChanged.emit()
 
+    def _on_rename_file(self, file_obj):
+        """应用内单文件改名：组合身份/关联/金额/日期全部保留（不重扫、不 advance）。"""
+        if not self.store or file_obj is None:
+            return
+        default_base = file_obj.file_name
+        if "." in default_base:
+            default_base = default_base.rsplit(".", 1)[0]
+        new_base, ok = QInputDialog.getText(
+            self, "重命名文件", "请输入新文件名（不含扩展名）：",
+            text=default_base,
+        )
+        if not ok or not new_base or not new_base.strip():
+            return
+        new_base = new_base.strip()
+        for ch in r'<>:"/\|?*':
+            new_base = new_base.replace(ch, "_")
+        if not new_base:
+            return
+        if self.kind == "invoice":
+            names = self.store.rename_group([file_obj.file_id], [], new_base)
+        else:
+            names = self.store.rename_group([], [file_obj.file_id], new_base)
+        if names:
+            MkMessage.success(self, f"重命名成功：{names[0]}")
+            # 单文件改名停在原位（不 advance），仅重载 Store（不重扫）
+            self.reload_from_store(keep_view=True)
+        else:
+            MkMessage.error(
+                self, "重命名失败，可能目标文件已存在或文件被占用。"
+            )
+
+    def _on_prune_dangling(self, files) -> None:
+        """清理失效关联：只动这些文件自身一侧指向失效对象的引用。"""
+        if not self.store or not files:
+            return
+        total = 0
+        for f in files:
+            total += self.store.prune_dangling_links(f.file_id)
+        self.refresh_status()
+        MkMessage.success(self, f"已清理 {total} 条失效关联")
+
     def _on_unlink_all(self, file_obj, partner_ids: list[str]):
         """取消单个文件全部关联（带确认）。"""
         if not self.store:
@@ -918,7 +1007,12 @@ class FileListPanel(QWidget):
                 self.store.remove_association(file_obj.file_id, pid)
             else:
                 self.store.remove_association(pid, file_obj.file_id)
-        MkMessage.success(self, f"已取消「{file_obj.file_name}」的全部关联")
+        # 语义是「清空我这边全部关联」：失效对象在另一侧选不中，连带清掉
+        pruned = self.store.prune_dangling_links(file_obj.file_id)
+        text = f"已取消「{file_obj.file_name}」的全部关联"
+        if pruned:
+            text += f"（含 {pruned} 条失效）"
+        MkMessage.success(self, text)
 
     def _on_unlink_all_files(self, files):
         """多选文件：确认后逐个取消全部关联，完成后提示取消条数。"""
@@ -940,6 +1034,7 @@ class FileListPanel(QWidget):
                     ok = self.store.remove_association(pid, f.file_id)
                 if ok:
                     removed += 1
+            removed += self.store.prune_dangling_links(f.file_id)
         MkMessage.success(
             self, f"已取消 {len(files)} 个文件的全部关联，共 {removed} 条",
         )
@@ -965,6 +1060,7 @@ class FileListPanel(QWidget):
                     self.store.remove_association(fid, pid)
                 else:
                     self.store.remove_association(pid, fid)
+            self.store.prune_dangling_links(fid)
         MkMessage.success(self, f"已取消组合「{combo['name']}」内全部关联")
 
     def refresh_status(self):
@@ -995,8 +1091,9 @@ class FileListPanel(QWidget):
             item.setText(COL_AMOUNT, self._format_amount(f))
             badge = self.tree.itemWidget(item, COL_STATUS)
             if badge:
-                linked, count, auto = self._link_state(f)
-                badge.set_linked(linked, count, auto=auto)
+                linked, count, auto, dangling = self._link_state(f)
+                badge.set_linked(linked, count, auto=auto, dangling=dangling)
+                badge.setToolTip(self._link_tooltip(count, dangling))
 
             if f.file_id in expanded_fids and item.childCount() > 0:
                 item.setExpanded(True)
