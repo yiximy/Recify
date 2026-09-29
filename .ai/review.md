@@ -283,3 +283,51 @@ Codex 第 2 轮只改 3 个允许文件（store.py / list_view_state.py / compar
 - `rename_paths` 两阶段会在同目录短暂出现 `.rectmp` 临时名；崩溃中断可能残留
   （与既有单文件路径同级风险，已由回滚覆盖异常路径）。
 - backlog：store.py 954 行、file_list_panel.py 1020 行仍超 800 约束。
+
+## 改名自愈 / 失效关联清理 / 导出 Excel 审查结论（2026-09-29 追加）
+
+**结论：通过 ✅**（已按规则提交推送） ｜ 审查人：Claude Code
+
+### 1. 资源管理器改名后组合掉队 + 关联/OCR 丢失
+- **根因**：`generate_file_id = sha1(path|mtime)` 把路径算进 id → 改名即换 id；
+  旧记录被标 `missing` 但仍被组合/关联引用，新记录一无所知 → 组合成员掉队但计数不变，
+  OCR 金额与票面日期需重跑。
+- **实现**：新增 `app/core/file_identity.py`（Qt-free 纯逻辑）：身份键 `(size, mtime, ext)`，
+  **候选唯一且未被多条新记录争抢才采纳**；`merge_*` 在「标 missing 后、`_prune_shell_combos` 前」规划并
+  `_adopt_renamed`：新记录继承 amount / document_date(_source) / `linked_*_ids`，删除旧 missing 记录，
+  `_remap_file_ids` 重映射（含 `combos.file_ids`）；NEW·旧 id 不复用（复用会导致下次重扫再次对不上）。
+- **新增**：文件行右键「重命名」（组合成员、独立文件皆可），走 `rename_group` 单文件模式，**不 advance**（停原位）。
+- **Claude 独立抽查**：真实 `os.rename` + 重扫 → 组合仍 2 有效成员且指向新 id、旧 missing 记录已删、
+  关联/`1234.5` 金额/`2026-03-05` 票面日期全部接管、列表无孤立顶层项；**歧义场景（两条同 size+mtime+ext）
+  不误配**；应用内改名 → 组合成员身份保留、行 index 不变、金额 88.0 与手动日期 2026-07-01 保留、磁盘确已改名。
+
+### 2. 失效关联仍计数且无法清理
+- **根因**：`_link_state` 直接数 `linked_*_ids` 原始条数（不校验对象是否存在/是否 missing）；
+  `_partner_entries` 跳过 missing 对象 → 展开子行与「取消所有关联」都碰不到这些 id；
+  「取消关联」按钮要求两侧都选中，失效对象在另一侧根本选不到 → 无处可清。
+- **实现**：`_link_state` 改为 4 元组（有效?/有效数/全自动/失效数），只统计「记录存在且非 missing」；
+  `StatusBadge` 宽 78→96 并支持 `已关联 N ⚠M` / `失效 N`（警示黄 + tooltip）；新增
+  `store.prune_dangling_links(file_id)`（按文件、只动自身一侧引用，**不静默删对方数据**）；
+  三处「取消所有关联」入口连带清理；新增右键「清理失效关联」（仅确有失效时出现）。
+- **Claude 独立抽查**（复刻人类场景）：关联 2 成员组合 → `已关联 2`；删一侧后 → `已关联 1 ⚠1`（**不再是 3**）；
+  再关联一张 → `已关联 2 ⚠1`（失效不叠加）；清理返回 1 条、失效条目与 associations 残留清空、徽标回到 `已关联 2`。
+
+### 3. 导出 Excel
+- **实现**：`[导出 Excel]` 加入按钮行（重命名关联右侧）；`app/core/excel_export.py` 用**标准库**
+  `zipfile` + XML 写最小 xlsx（全 `inlineStr`，五类 XML 转义），**未新增任何依赖**（openpyxl/xlsxwriter 本机均无，
+  pandas 是传递依赖且写 xlsx 同样需要引擎，故不用）；`build_association_rows` 只导出**有效关联**，
+  含金额（2 位小数）、日期（附票面/手动/文件来源）、所属组合、自动/手动。
+- **Claude 独立抽查**：`zipfile` + `ElementTree` 读回 → 五个必要成员齐全、行数 = 表头 + 有效关联数、
+  表头正确、金额与文件名与 store 一致；**真实 `&` `'` 文件名**与**合成 `< > "` 值**均无损读回；
+  UI 全链路（打桩 `QFileDialog`）点击导出按钮 → 文件生成、提示「已导出 1 条关联」、内容含改名后文件名。
+
+### 验证
+- Claude 独立抽查 **44/44**（主脚本 29 + UI 层 15），`check.sh` 全绿，`excel_export` 自检 OK，
+  `file_identity` 歧义/唯一两分支直测 OK。README 已补「单文件重命名 / 导出 Excel」与两条 FAQ。
+- **Codex 反向指出我脚本两处错误**（值得记录）：① 我把「1 有效 + 1 失效」断言成 `已关联 2`，
+  按 brief 的有效计数规则应为 `已关联 1 ⚠1`（实现是对的）；② 我用 `< >` 做真实 `os.rename`，
+  Windows 非法文件名会崩。→ 已改为打桩喂值 + 只用合法字符做真实改名。
+
+### 遗留（已记 backlog）
+- `store.py` 1047 行、`file_list_panel.py` 1117 行仍超 800 行约束（本轮新逻辑均落在新模块）。
+- 改名自愈是启发式（size+mtime+ext）：极端情况下同尺寸同秒修改的两个文件无法区分 → 按设计跳过不猜。
