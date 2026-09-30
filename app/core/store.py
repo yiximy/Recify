@@ -11,12 +11,24 @@ from typing import Iterable, Optional
 
 from .models import (
     InvoiceFile, PaymentFile, Association, AmountRecord,
-    generate_file_id, now_iso,
+    generate_file_id, now_iso, normalize_tags,
 )
 from .rename_plan import (
     has_target_conflict, plan_target_paths, remap_dict_keys, rename_paths,
 )
 from .file_identity import plan_rename_adoptions
+from .tag_stats import build_tag_stats
+
+
+def _parse_iso_date(value: str):
+    """解析 ISO 日期字符串（YYYY-MM-DD）；非法/为空返回 None。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 class Store:
@@ -139,6 +151,7 @@ class Store:
                 if inv.file_id in existing:
                     old = existing[inv.file_id]
                     inv.linked_payment_ids = old.get("linked_payment_ids", [])
+                    inv.tags = normalize_tags(old.get("tags", []))
                     inv.amount = AmountRecord.from_dict(old.get("amount"))
                     if old.get("document_date"):
                         inv.document_date = old.get("document_date", "")
@@ -180,6 +193,7 @@ class Store:
                 if pay.file_id in existing:
                     old = existing[pay.file_id]
                     pay.linked_invoice_ids = old.get("linked_invoice_ids", [])
+                    pay.tags = normalize_tags(old.get("tags", []))
                     pay.amount = AmountRecord.from_dict(old.get("amount"))
                     if old.get("document_date"):
                         pay.document_date = old.get("document_date", "")
@@ -212,6 +226,7 @@ class Store:
                 continue
             new["amount"] = old.get("amount", AmountRecord().to_dict())
             new[link_key] = list(old.get(link_key, []))
+            new["tags"] = normalize_tags(old.get("tags", []))
             if old.get("document_date"):
                 new["document_date"] = old["document_date"]
                 new["document_date_source"] = old.get("document_date_source", "")
@@ -608,6 +623,7 @@ class Store:
                 "kind": kind,
                 "name": (name or "未命名组合").strip(),
                 "file_ids": valid,
+                "tags": [],
                 "created_at": now_iso(),
             })
             self._save()
@@ -629,17 +645,23 @@ class Store:
     def get_combos(self, kind: str) -> list[dict]:
         """获取指定类型的组合列表（副本，避免外部误改）。"""
         with self._lock:
-            return [
-                dict(c) for c in self._data.get("combos", [])
-                if c.get("kind") == kind
-            ]
+            result: list[dict] = []
+            for c in self._data.get("combos", []):
+                if c.get("kind") != kind:
+                    continue
+                combo = dict(c)
+                combo["tags"] = normalize_tags(combo.get("tags", []))
+                result.append(combo)
+            return result
 
     def get_combo(self, combo_id: str) -> Optional[dict]:
         """按 combo_id 获取组合（副本）。"""
         with self._lock:
             for c in self._data.get("combos", []):
                 if c["combo_id"] == combo_id:
-                    return dict(c)
+                    combo = dict(c)
+                    combo["tags"] = normalize_tags(combo.get("tags", []))
+                    return combo
             return None
 
     def combo_has_active_members(self, combo_id: str) -> bool:
@@ -750,6 +772,73 @@ class Store:
                     continue
                 total += amt
             return round(total, 2)
+
+    # ── 标签（Tag）管理 ────────────────────────────────────
+
+    def set_file_tags(self, kind: str, file_id: str, tags: list) -> None:
+        """替换单个发票/支付记录文件的标签（规范化后写库）。"""
+        with self._lock:
+            data_key = "invoices" if kind == "invoice" else "payments"
+            entry = self._data[data_key].get(file_id)
+            if entry is None:
+                return
+            entry["tags"] = normalize_tags(tags)
+            self._save()
+            self._notify()
+
+    def set_combo_tags(self, combo_id: str, tags: list) -> None:
+        """替换单个组合的标签（规范化后写库）。"""
+        with self._lock:
+            for combo in self._data.get("combos", []):
+                if combo["combo_id"] == combo_id:
+                    combo["tags"] = normalize_tags(tags)
+                    self._save()
+                    self._notify()
+                    return
+
+    def get_all_tags(self) -> list[str]:
+        """返回全部现存标签：按使用次数降序、同次数按名称升序。
+
+        计数口径为「标签出现次数」：文件标签与组合标签各计一次。
+        """
+        with self._lock:
+            counts: dict[str, int] = {}
+            for data_key in ("invoices", "payments"):
+                for entry in self._data[data_key].values():
+                    for tag in normalize_tags(entry.get("tags", [])):
+                        counts[tag] = counts.get(tag, 0) + 1
+            for combo in self._data.get("combos", []):
+                for tag in normalize_tags(combo.get("tags", [])):
+                    counts[tag] = counts.get(tag, 0) + 1
+            return sorted(counts, key=lambda t: (-counts[t], t))
+
+    @staticmethod
+    def format_date_range(start_iso: str, end_iso: str) -> str:
+        """日期区间显示：同年 2026.6.30-7.21；跨年 2026.12.30-2027.1.5；同天 2026.6.30。"""
+        start = _parse_iso_date(start_iso)
+        end = _parse_iso_date(end_iso)
+        if start is None and end is None:
+            return ""
+        if start is None:
+            start = end
+        if end is None:
+            end = start
+        head = f"{start.year}.{start.month}.{start.day}"
+        if start == end:
+            return head
+        if start.year == end.year:
+            tail = f"{end.month}.{end.day}"
+        else:
+            tail = f"{end.year}.{end.month}.{end.day}"
+        return f"{head}-{tail}"
+
+    def get_tag_stats(self) -> dict:
+        """按标签统计（唯一口径，供对话框预览与导出共用）。
+
+        详细口径见 ``app.core.tag_stats`` 模块文档字符串。
+        """
+        with self._lock:
+            return build_tag_stats(self)
 
     # ── 自动比对 ────────────────────────────────────────────
 

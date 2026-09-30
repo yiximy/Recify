@@ -1,36 +1,85 @@
 ﻿# -*- coding: utf-8 -*-
-"""关联信息导出为最小 xlsx（Qt-free，仅用标准库）。
+"""关联明细 + 费用报销表导出为 xlsx（Qt-free，仅标准库 zipfile + XML）。
 
 不引入 ``openpyxl`` / ``xlsxwriter``：直接按 OOXML 约定用 ``zipfile`` + XML
-拼出最小可用工作簿（``[Content_Types].xml`` / ``_rels/.rels`` /
-``xl/workbook.xml`` / ``xl/_rels/workbook.xml.rels`` /
-``xl/worksheets/sheet1.xml``）。
+拼出工作簿（``[Content_Types].xml`` / ``_rels/.rels`` / ``xl/workbook.xml`` /
+``xl/_rels/workbook.xml.rels`` / ``xl/styles.xml`` / ``xl/worksheets/sheetN.xml``）。
 
-单元格取值取舍：金额与日期都写成**格式化字符串**（``inlineStr``），
-金额固定 2 位小数（``f"{amount:.2f}"``）；这样无需在表格里再处理数字格式，
-且便于文本校验。全部文本都做 XML 转义，文件名含 ``& < > " '`` 也不会破坏文件。
+写入器支持多工作表与具名样式（见 ``STYLE_INDEX``）：金额等数字写成**真数值**
+（``<v>``），合计行写 ``SUM`` 公式（同时带缓存值），列宽/行高/合并对齐模板
+「费用报销表」。文本仍做 XML 转义，文件名含 ``& < > " '`` 也不会破坏文件。
+
+旧接口 ``build_association_rows`` / ``write_xlsx`` 保持可用（关联明细由前者派生）。
 """
 from __future__ import annotations
 
 import zipfile
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
-# 表头（列顺序即导出列顺序）
+# 关联明细表头（列顺序即导出列顺序）
 HEADERS = [
     "发票文件名", "发票金额", "发票日期",
     "支付记录文件名", "支付金额", "支付日期",
     "所属组合", "关联方式",
 ]
 
+# 费用报销表布局（对齐参考模板，列宽容差 0.1）
+SUMMARY_HEADERS = ["序号", "日期", "摘要", "票据张数", "金额", "备注"]
+SUMMARY_COL_WIDTHS = (9, 20.48, 42.89, 11.56, 17.11, 25.18)
+DETAIL_COL_WIDTHS = (30, 12, 20, 30, 12, 20, 24, 10, 22, 22)
+
 # 日期来源的中文后缀标签
 _DATE_SOURCE_LABELS = {"ocr": "票面", "manual": "手动", "file": "文件"}
+
+# 具名样式 -> cellXfs 索引（与 _STYLES_XML 中顺序一致）
+STYLE_INDEX = {
+    "default": 0,
+    "title": 1,
+    "subtitle": 2,
+    "header": 3,
+    "center": 4,
+    "text": 5,
+    "number": 6,
+    "total": 7,
+}
+
+
+# ── 写入器数据模型 ──────────────────────────────────────────
+
+@dataclass
+class Cell:
+    """单元格：纯值 / 具名样式 / 公式（``formula`` 不含前导 '='）。"""
+
+    value: Any = None
+    style: Optional[str] = None
+    formula: Optional[str] = None
+
+
+@dataclass
+class Sheet:
+    """一个工作表：名称 + 行数据 + 合并区 + 列宽 + 行高。"""
+
+    name: str
+    rows: list
+    merges: tuple = ()
+    col_widths: tuple = ()
+    row_heights: dict = field(default_factory=dict)
 
 
 # ── 数据构建（业务逻辑，UI 不得重复实现）──────────────────────
 
+def _amount_value(file) -> Optional[float]:
+    """金额列数值：``final_amount``，无金额返回 None。"""
+    amount = getattr(file, "amount", None)
+    if amount is None:
+        return None
+    return amount.final_amount
+
+
 def _amount_text(file) -> str:
     """金额列文本：``final_amount`` 保留 2 位，无金额返回空串。"""
-    amount = getattr(file, "amount", None)
-    value = amount.final_amount if amount is not None else None
+    value = _amount_value(file)
     return "" if value is None else f"{value:.2f}"
 
 
@@ -63,18 +112,17 @@ def _combo_text(combo_names: dict[str, str], invoice_id: str,
     return inv_name or pay_name
 
 
-def build_association_rows(store) -> list[list[str]]:
-    """生成导出数据：首行表头 + 每条**有效**关联一行。
+def _association_records(store):
+    """逐条产出**有效**关联：``{'invoice', 'payment', 'combo', 'auto'}``。
 
     有效 = 关联双方的记录都存在且 ``missing == False``；未关联的文件不出现，
-    失效关联被跳过（不做额外汇总页）。关联方式取自冗余关联表的 ``auto_linked``。
+    失效关联被跳过。关联方式取自冗余关联表的 ``auto_linked``。
     """
-    rows: list[list[str]] = [list(HEADERS)]
     invoices = {f.file_id: f for f in store.get_invoices()}
     payments = {f.file_id: f for f in store.get_payments()}
     combo_names = _combo_name_map(store)
 
-    seen: set[tuple[str, str]] = set()
+    seen: set = set()
     for assoc in store.get_associations():
         invoice_id = assoc.get("invoice_id", "")
         payment_id = assoc.get("payment_id", "")
@@ -85,13 +133,155 @@ def build_association_rows(store) -> list[list[str]]:
         payment = payments.get(payment_id)
         if invoice is None or payment is None:
             continue
+        yield {
+            "invoice": invoice,
+            "payment": payment,
+            "combo": _combo_text(combo_names, invoice_id, payment_id),
+            "auto": bool(assoc.get("auto_linked")),
+        }
+
+
+def build_association_rows(store) -> list[list[str]]:
+    """生成关联明细数据：首行表头 + 每条**有效**关联一行（全部文本）。"""
+    rows: list[list[str]] = [list(HEADERS)]
+    for rec in _association_records(store):
         rows.append([
-            invoice.file_name, _amount_text(invoice), _date_text(store, invoice),
-            payment.file_name, _amount_text(payment), _date_text(store, payment),
-            _combo_text(combo_names, invoice_id, payment_id),
-            "自动" if assoc.get("auto_linked") else "手动",
+            rec["invoice"].file_name,
+            _amount_text(rec["invoice"]),
+            _date_text(store, rec["invoice"]),
+            rec["payment"].file_name,
+            _amount_text(rec["payment"]),
+            _date_text(store, rec["payment"]),
+            rec["combo"],
+            "自动" if rec["auto"] else "手动",
         ])
     return rows
+
+
+def _combo_tags(store, kind: str) -> dict[str, list]:
+    """file_id -> 所属组合（指定 kind）的标签并集（保序去重）。"""
+    result: dict[str, list] = {}
+    for combo in store.get_combos(kind):
+        tags = combo.get("tags", []) or []
+        for file_id in combo.get("file_ids", []):
+            bucket = result.setdefault(file_id, [])
+            for tag in tags:
+                if tag not in bucket:
+                    bucket.append(tag)
+    return result
+
+
+def _file_tags(file, combo_tags: dict[str, list]) -> list:
+    """标签列取值：记录自身标签 + 所属组合标签（保序去重）。"""
+    merged: list = []
+    for tag in list(getattr(file, "tags", []) or []) + combo_tags.get(
+            file.file_id, []):
+        if tag and tag not in merged:
+            merged.append(tag)
+    return merged
+
+
+def build_detail_sheet(store) -> Sheet:
+    """关联明细工作表：``build_association_rows`` 内容 + 发票/支付两列标签。"""
+    headers = list(HEADERS) + ["发票标签", "支付标签"]
+    rows: list = [[Cell(text, "header") for text in headers]]
+    invoice_combo_tags = _combo_tags(store, "invoice")
+    payment_combo_tags = _combo_tags(store, "payment")
+    for rec in _association_records(store):
+        invoice = rec["invoice"]
+        payment = rec["payment"]
+        rows.append([
+            Cell(invoice.file_name, "text"),
+            Cell(_amount_value(invoice), "number"),
+            Cell(_date_text(store, invoice), "center"),
+            Cell(payment.file_name, "text"),
+            Cell(_amount_value(payment), "number"),
+            Cell(_date_text(store, payment), "center"),
+            Cell(rec["combo"], "text"),
+            Cell("自动" if rec["auto"] else "手动", "center"),
+            Cell("、".join(_file_tags(invoice, invoice_combo_tags)), "text"),
+            Cell("、".join(_file_tags(payment, payment_combo_tags)), "text"),
+        ])
+    return Sheet(
+        name="关联明细",
+        rows=rows,
+        col_widths=DETAIL_COL_WIDTHS,
+        row_heights={1: 22},
+    )
+
+
+def build_summary_sheet(store, tags, include_untagged: bool,
+                        unit_text: str) -> Sheet:
+    """费用报销表工作表：标题 / 报销单位+期间 / 表头 / 数据行 / 合计行。
+
+    ``tags`` 为要包含的标签名列表（顺序即行顺序）；``include_untagged`` 为真时
+    追加「未分类」行。金额列写入真数值，合计行 D/E 写 SUM 公式（带缓存值）。
+    """
+    stats = store.get_tag_stats()
+    by_tag = {c["tag"]: c for c in stats["tags"]}
+    selected = [by_tag[t] for t in tags if t in by_tag]
+    if include_untagged:
+        selected.append(stats["untagged"])
+
+    starts = [c["date_start"] for c in selected if c["date_start"]]
+    ends = [c["date_end"] for c in selected if c["date_end"]]
+    period = store.format_date_range(
+        min(starts) if starts else "", max(ends) if ends else ""
+    )
+
+    rows: list = []
+    rows.append([Cell("费用报销表", "title")] + [Cell(None, "title")] * 5)
+    subtitle = f"报销单位：{unit_text or ''}          费用报销期间：{period}"
+    rows.append([Cell(subtitle, "subtitle")] + [Cell(None, "subtitle")] * 5)
+    rows.append([Cell(text, "header") for text in SUMMARY_HEADERS])
+
+    first_data = 4
+    for index, cat in enumerate(selected):
+        rows.append([
+            Cell(index + 1, "center"),
+            Cell(cat["date_text"], "center"),
+            Cell(cat["tag"], "text"),
+            Cell(cat["count"], "center"),
+            Cell(cat["amount"], "number"),
+            Cell(cat["note"], "text"),
+        ])
+
+    total_row = first_data + len(selected)
+    if selected:
+        last_data = total_row - 1
+        d_cell = Cell(
+            formula=f"SUM(D{first_data}:D{last_data})",
+            value=sum(c["count"] for c in selected),
+            style="center",
+        )
+        e_cell = Cell(
+            formula=f"SUM(E{first_data}:E{last_data})",
+            value=round(sum(c["amount"] for c in selected), 2),
+            style="number",
+        )
+    else:
+        d_cell = Cell(0, "center")
+        e_cell = Cell(0, "number")
+    rows.append([
+        Cell(None, "total"),
+        Cell(None, "total"),
+        Cell("合计", "total"),
+        d_cell,
+        e_cell,
+        Cell(None, "total"),
+    ])
+
+    heights = {1: 36, 2: 25, 3: 25, total_row: 20}
+    for offset in range(len(selected)):
+        heights[first_data + offset] = 20
+
+    return Sheet(
+        name="费用报销表",
+        rows=rows,
+        merges=("A1:F1", "A2:F2"),
+        col_widths=SUMMARY_COL_WIDTHS,
+        row_heights=heights,
+    )
 
 
 # ── xlsx 写入 ────────────────────────────────────────────────
@@ -115,64 +305,190 @@ def _col_letter(index: int) -> str:
     return letters
 
 
-def _cell(ref: str, value) -> str:
-    """构造一个 inlineStr 单元格（空值写空字符串）。"""
-    text = "" if value is None else str(value)
-    return (f'<c r="{ref}" t="inlineStr"><is>'
-            f'<t xml:space="preserve">{_escape(text)}</t></is></c>')
+def _num_text(value) -> str:
+    """数字 -> XML 文本：整数原样、浮点用 repr 保精度（显示交给 number 格式）。"""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    return repr(float(value))
 
 
-def _sheet_xml(rows: list[list]) -> str:
-    body = []
-    for row_index, values in enumerate(rows, start=1):
+def _style_index(style) -> Optional[int]:
+    if style is None:
+        return None
+    if isinstance(style, int):
+        return style
+    return STYLE_INDEX.get(style, 0)
+
+
+def _cell_xml(ref: str, raw) -> str:
+    """把纯值 / ``Cell`` 渲染为单元格 XML。"""
+    cell = raw if isinstance(raw, Cell) else Cell(value=raw)
+    style = _style_index(cell.style)
+    s_attr = f' s="{style}"' if style is not None else ""
+
+    if cell.formula:
+        inner = f"<f>{_escape(cell.formula)}</f>"
+        if cell.value is not None:
+            inner += f"<v>{_num_text(cell.value)}</v>"
+        return f'<c r="{ref}"{s_attr}>{inner}</c>'
+
+    value = cell.value
+    if value is None or (isinstance(value, str) and value == ""):
+        return f'<c r="{ref}"{s_attr}/>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"{s_attr}><v>{_num_text(value)}</v></c>'
+    return (f'<c r="{ref}"{s_attr} t="inlineStr"><is>'
+            f'<t xml:space="preserve">{_escape(str(value))}</t></is></c>')
+
+
+def _sheet_xml(sheet: Sheet) -> str:
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+    ]
+    if sheet.col_widths:
+        cols = "".join(
+            f'<col min="{i}" max="{i}" width="{_num_text(w)}" customWidth="1"/>'
+            for i, w in enumerate(sheet.col_widths, start=1)
+        )
+        parts.append(f"<cols>{cols}</cols>")
+
+    rows_xml = []
+    for row_index, values in enumerate(sheet.rows, start=1):
+        attrs = f' r="{row_index}"'
+        height = sheet.row_heights.get(row_index)
+        if height:
+            attrs += f' ht="{_num_text(height)}" customHeight="1"'
         cells = "".join(
-            _cell(f"{_col_letter(i)}{row_index}", value)
+            _cell_xml(f"{_col_letter(i)}{row_index}", value)
             for i, value in enumerate(values)
         )
-        body.append(f'<row r="{row_index}">{cells}</row>')
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f'<sheetData>{"".join(body)}</sheetData></worksheet>'
+        rows_xml.append(f"<row{attrs}>{cells}</row>")
+    parts.append(f'<sheetData>{"".join(rows_xml)}</sheetData>')
+
+    if sheet.merges:
+        merged = "".join(f'<mergeCell ref="{ref}"/>' for ref in sheet.merges)
+        parts.append(f'<mergeCells count="{len(sheet.merges)}">{merged}</mergeCells>')
+
+    parts.append("</worksheet>")
+    return "".join(parts)
+
+
+_STYLES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    '<numFmts count="1"><numFmt numFmtId="176" formatCode="#,##0.00"/></numFmts>'
+    '<fonts count="3">'
+    '<font><sz val="12"/><color rgb="FF000000"/><name val="宋体"/><charset val="134"/></font>'
+    '<font><sz val="20"/><color rgb="FF000000"/><name val="宋体"/><charset val="134"/></font>'
+    '<font><sz val="11"/><color rgb="FF000000"/><name val="宋体"/><charset val="134"/></font>'
+    '</fonts>'
+    '<fills count="2">'
+    '<fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill>'
+    '</fills>'
+    '<borders count="2">'
+    '<border><left/><right/><top/><bottom/><diagonal/></border>'
+    '<border>'
+    '<left style="thin"><color auto="1"/></left>'
+    '<right style="thin"><color auto="1"/></right>'
+    '<top style="thin"><color auto="1"/></top>'
+    '<bottom style="thin"><color auto="1"/></bottom>'
+    '<diagonal/></border>'
+    '</borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="8">'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="center"/></xf>'
+    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="176" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+    '</cellXfs>'
+    '</styleSheet>'
+)
+
+_ROOT_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+    '</Relationships>'
+)
+
+
+def _content_types(sheet_count: int) -> str:
+    overrides = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{i}.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for i in range(1, sheet_count + 1)
     )
-
-
-def write_xlsx(path: str, rows: list[list], sheet_name: str = "关联信息") -> None:
-    """把 ``rows`` 写成最小 xlsx 文件（单工作表，全部 inlineStr）。"""
-    content_types = (
+    return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        f'{overrides}'
         '</Types>'
     )
-    root_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-        '</Relationships>'
+
+
+def _workbook_xml(sheets: list) -> str:
+    entries = "".join(
+        f'<sheet name="{_escape(sheet.name)}" sheetId="{i}" r:id="rId{i}"/>'
+        for i, sheet in enumerate(sheets, start=1)
     )
-    workbook = (
+    return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        f'<sheets><sheet name="{_escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets>'
+        f'<sheets>{entries}</sheets>'
         '</workbook>'
     )
-    workbook_rels = (
+
+
+def _workbook_rels(sheet_count: int) -> str:
+    rels = "".join(
+        f'<Relationship Id="rId{i}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        f'Target="worksheets/sheet{i}.xml"/>'
+        for i in range(1, sheet_count + 1)
+    )
+    styles = (
+        f'<Relationship Id="rId{sheet_count + 1}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+    )
+    return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        f'{rels}{styles}'
         '</Relationships>'
     )
+
+
+def write_report(path: str, sheets: list) -> None:
+    """把多个 ``Sheet`` 写成一个多工作表 xlsx（具名样式 + 真数值 + SUM）。"""
+    sheet_list = list(sheets)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types)
-        archive.writestr("_rels/.rels", root_rels)
-        archive.writestr("xl/workbook.xml", workbook)
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        archive.writestr("xl/worksheets/sheet1.xml", _sheet_xml(rows))
+        archive.writestr("[Content_Types].xml", _content_types(len(sheet_list)))
+        archive.writestr("_rels/.rels", _ROOT_RELS)
+        archive.writestr("xl/workbook.xml", _workbook_xml(sheet_list))
+        archive.writestr("xl/_rels/workbook.xml.rels",
+                         _workbook_rels(len(sheet_list)))
+        archive.writestr("xl/styles.xml", _STYLES_XML)
+        for i, sheet in enumerate(sheet_list, start=1):
+            archive.writestr(f"xl/worksheets/sheet{i}.xml", _sheet_xml(sheet))
+
+
+def write_xlsx(path: str, rows: list, sheet_name: str = "关联信息") -> None:
+    """兼容旧接口：单工作表写出 ``rows``（纯值，数字自动写真数值）。"""
+    write_report(path, [Sheet(name=sheet_name, rows=rows)])
 
 
 # ── 自检：生成临时文件 → 标准库读回校验 ─────────────────────
@@ -193,7 +509,8 @@ if __name__ == "__main__":
         with zipfile.ZipFile(out) as archive:
             required = {
                 "[Content_Types].xml", "_rels/.rels", "xl/workbook.xml",
-                "xl/_rels/workbook.xml.rels", "xl/worksheets/sheet1.xml",
+                "xl/_rels/workbook.xml.rels", "xl/styles.xml",
+                "xl/worksheets/sheet1.xml",
             }
             assert required <= set(archive.namelist()), "缺少必要成员"
             xml_text = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")

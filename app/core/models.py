@@ -17,6 +17,21 @@ def generate_file_id(abs_path: str, modified_iso: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def normalize_tags(tags) -> list:
+    """规范化标签列表：去空白、去空串、去重、保持首次出现顺序。"""
+    if not tags:
+        return []
+    normalized: list = []
+    seen: set = set()
+    for raw in tags:
+        text = str(raw).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return normalized
+
+
 @dataclass
 class FileInfo:
     """文件基础信息"""
@@ -31,6 +46,9 @@ class FileInfo:
     # 票面日期（ISO 日期）；OCR 失败时由 Store 统一回退文件修改时间
     document_date: str = ""
     document_date_source: str = ""       # "ocr" | "file" | ""
+
+    # 自定义标签（自由文本，发票/支付记录共用基类）；旧数据缺失时默认空列表
+    tags: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

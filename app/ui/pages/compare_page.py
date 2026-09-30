@@ -12,7 +12,10 @@ from PySide6.QtWidgets import (
 )
 from monkeyqt import MkButton, MkMessage
 
-from app.core.excel_export import build_association_rows, write_xlsx
+from app.core.excel_export import (
+    build_detail_sheet, build_summary_sheet, write_report,
+)
+from app.ui.widgets.export_dialog import ExportDialog
 from app.ui.widgets.file_list_panel import FileListPanel
 from app.ui.widgets.match_flow_dialog import MatchFlowDialog
 from app.ui.widgets.preview_view import PreviewView
@@ -396,24 +399,38 @@ class ComparePage(QWidget):
             )
 
     def _on_export_excel(self):
-        """导出有效关联为 Excel：UI 只负责取路径与提示，逻辑全在 core。"""
+        """导出费用报销表 + 关联明细：UI 只取参数/路径与提示，逻辑全在 core。"""
         if not self.store:
             return
-        default_name = f"关联信息_{datetime.now():%Y%m%d}.xlsx"
+        dialog = ExportDialog(self.store, config=self.config, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        params = dialog.result_params()
+        default_name = f"费用报销表_{datetime.now():%Y%m%d}.xlsx"
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出关联信息", default_name, "Excel 文件 (*.xlsx)",
+            self, "导出 Excel", default_name, "Excel 文件 (*.xlsx)",
         )
         if not path:
             return
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
         try:
-            rows = build_association_rows(self.store)
-            write_xlsx(path, rows)
+            summary = build_summary_sheet(
+                self.store, params["tags"], params["include_untagged"],
+                params["unit"],
+            )
+            sheets = [summary]
+            if params["include_detail"]:
+                sheets.append(build_detail_sheet(self.store))
+            write_report(path, sheets)
         except OSError as exc:
             MkMessage.error(self, f"导出失败：{exc}")
             return
-        MkMessage.success(self, f"已导出 {len(rows) - 1} 条关联到\n{path}")
+        category_count = len(summary.rows) - 4   # 去掉标题/期间/表头/合计
+        MkMessage.success(
+            self,
+            f"已导出 {len(sheets)} 个工作表（{category_count} 个类别）到\n{path}",
+        )
 
     def _on_combos_changed(self):
         """组合增删后：两侧面板重建树（保持层级与金额最新）。"""

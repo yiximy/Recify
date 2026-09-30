@@ -33,6 +33,7 @@ from app.core.file_scanner import FileScanner
 from app.core.pdf_renderer import PdfRenderer
 from app.core.ocr_engine import OcrEngine, OcrLine
 from app.core.app_config import AppConfig
+from app.core.tag_stats import build_tag_stats
 from app.workers.ocr_worker import OcrWorker
 print('  core + workers imports OK')
 "
@@ -49,6 +50,8 @@ from app.ui.widgets.amount_edit_cell import AmountEditCell
 from app.ui.widgets.confirm_checkbox import ConfirmCheckBox
 from app.ui.widgets.folder_picker import FolderPicker
 from app.ui.widgets.preview_view import PreviewView
+from app.ui.widgets.tag_dialog import TagDialog
+from app.ui.widgets.export_dialog import ExportDialog
 from app.ui.pages.amount_page import AmountPage
 from app.ui.pages.compare_page import ComparePage
 from app.ui.pages.home_page import HomePage

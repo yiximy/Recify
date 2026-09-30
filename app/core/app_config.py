@@ -19,6 +19,7 @@ class AppConfig:
         "match_time_tolerance_days": 7,
         "match_time_unlimited": False,
         "match_amount_tolerance": 0.01,
+        "export_unit": "",   # 「费用报销表」报销单位
     }
 
     def __init__(self, path: str):

@@ -21,7 +21,7 @@ from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QApplication, QMenu,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
-    QInputDialog, QMessageBox,
+    QInputDialog, QMessageBox, QDialog,
 )
 
 from monkeyqt import MkButton, MkInput, MkMessage
@@ -31,6 +31,7 @@ from .list_view_state import (
 )
 from .status_badge import StatusBadge
 from .table_utils import enable_smooth_scroll
+from .tag_dialog import TagDialog
 from app.core.file_scanner import FileScanner
 from app.core.models import InvoiceFile, PaymentFile
 
@@ -39,7 +40,8 @@ COL_SEQ = 0       # 序号
 COL_NAME = 1      # 文件名
 COL_AMOUNT = 2    # 金额
 COL_DATE = 3      # 日期（优先票面日期，回退文件修改时间）
-COL_STATUS = 4    # 状态徽标
+COL_TAGS = 4      # 自定义标签
+COL_STATUS = 5    # 状态徽标
 
 STATUS_COL_WIDTH = 100   # 容纳「已关联 2 ⚠1」等失效提示
 
@@ -284,8 +286,10 @@ class FileListPanel(QWidget):
 
         # ── 文件树 ──
         self.tree = _HierarchyTree()
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(["序号", "文件名", "金额", "日期", "状态"])
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(
+            ["序号", "文件名", "金额", "日期", "标签", "状态"]
+        )
         self.tree.setRootIsDecorated(True)          # 显示展开箭头（仅对有子项者）
         self.tree.setIndentation(18)
         self.tree.setExpandsOnDoubleClick(True)
@@ -306,6 +310,7 @@ class FileListPanel(QWidget):
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(COL_AMOUNT, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_DATE, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_TAGS, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Fixed)
         self.tree.setColumnWidth(COL_STATUS, STATUS_COL_WIDTH)
 
@@ -435,6 +440,17 @@ class FileListPanel(QWidget):
         amt = f.amount.final_amount if f.amount else None
         return f"¥ {amt:,.2f}" if amt is not None else "—"
 
+    @staticmethod
+    def _tags_text(tags) -> str:
+        """标签列显示文本：用「、」连接；无标签返回空串。"""
+        return "、".join(str(t) for t in (tags or []) if str(t).strip())
+
+    def _set_tags_cell(self, item: QTreeWidgetItem, tags) -> None:
+        """填充标签列，并在 tooltip 给出完整标签列表。"""
+        text = self._tags_text(tags)
+        item.setText(COL_TAGS, text)
+        item.setToolTip(COL_TAGS, f"标签：{text}" if text else "无标签")
+
     def _make_file_item(self, seq: int, f) -> QTreeWidgetItem:
         """构造一个文件顶层树项，并按关联情况挂接子项。"""
         item = QTreeWidgetItem()
@@ -444,6 +460,7 @@ class FileListPanel(QWidget):
         item.setToolTip(COL_NAME, f.file_name)
         item.setText(COL_AMOUNT, self._format_amount(f))
         self._set_date_cell(item, f)
+        self._set_tags_cell(item, getattr(f, "tags", []))
         self._rebuild_children(item, f)
         return item
 
@@ -484,6 +501,7 @@ class FileListPanel(QWidget):
         item.setToolTip(COL_NAME, combo["name"])
         item.setText(COL_AMOUNT, self._format_combo_total(combo["combo_id"]))
         item.setText(COL_DATE, f"{len(combo['file_ids'])} 个成员")
+        self._set_tags_cell(item, combo.get("tags", []))
         item.setExpanded(True)
         bold = QFont()
         bold.setBold(True)
@@ -504,6 +522,7 @@ class FileListPanel(QWidget):
         child.setToolTip(COL_NAME, mf.file_name)
         child.setText(COL_AMOUNT, self._format_amount(mf))
         self._set_date_cell(child, mf)
+        self._set_tags_cell(child, getattr(mf, "tags", []))
         self._rebuild_children(child, mf)
         return child
 
@@ -862,8 +881,10 @@ class FileListPanel(QWidget):
         # 否则为右键文件
         if multi:
             unlink_files = self._collect_unlink_files(top_files, top_combos)
+            tag_files = list(unlink_files)
         else:
             unlink_files = [file_obj]
+            tag_files = [file_obj]
         has_partner = any(self._partner_entries(f) for f in unlink_files)
         dangling_total = sum(self._link_state(f)[3] for f in unlink_files)
 
@@ -871,6 +892,7 @@ class FileListPanel(QWidget):
 
         menu = QMenu(self.tree)
         menu.setStyleSheet(_MENU_QSS)
+        act_tags = menu.addAction("设置标签…")
         # 单文件（含组合成员）可应用内改名：组合身份/关联/金额/日期全部保留
         act_rename = menu.addAction("重命名") if not multi else None
         act_combo = menu.addAction("组合") if multi_files else None
@@ -886,7 +908,9 @@ class FileListPanel(QWidget):
         if not menu.actions():
             return
         selected_action = menu.exec(self.tree.viewport().mapToGlobal(pos))
-        if selected_action is act_rename:
+        if selected_action is act_tags:
+            self._on_set_file_tags(tag_files)
+        elif selected_action is act_rename:
             self._on_rename_file(file_obj)
         elif selected_action is act_combo:
             self._on_create_combo(
@@ -912,6 +936,7 @@ class FileListPanel(QWidget):
         partner_ids = self._combo_partner_ids(combo)
         menu = QMenu(self.tree)
         menu.setStyleSheet(_MENU_QSS)
+        act_tags = menu.addAction("设置标签…")
         act_dissolve = menu.addAction("取消组合")
         act_locate_all = None
         act_unlink_all = None
@@ -919,7 +944,9 @@ class FileListPanel(QWidget):
             act_locate_all = menu.addAction("定位所有")
             act_unlink_all = menu.addAction("取消所有关联")
         selected = menu.exec(self.tree.viewport().mapToGlobal(pos))
-        if selected is act_dissolve:
+        if selected is act_tags:
+            self._on_set_combo_tags(combo)
+        elif selected is act_dissolve:
             self._on_dissolve_combo(combo)
         elif selected is act_locate_all:
             self.locateAllRequested.emit(combo_id, partner_ids)
@@ -949,6 +976,40 @@ class FileListPanel(QWidget):
             return
         self.store.delete_combo(combo["combo_id"])
         self.combosChanged.emit()
+
+    def _on_set_file_tags(self, files) -> None:
+        """文件行「设置标签…」：勾选集合替换所选文件标签（多选即批量）。"""
+        if not self.store or not files:
+            return
+        union: list = []
+        for f in files:
+            for tag in getattr(f, "tags", []) or []:
+                if tag not in union:
+                    union.append(tag)
+        dialog = TagDialog(self.store, initial_tags=union, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        tags = dialog.selected_tags()
+        for f in files:
+            self.store.set_file_tags(self.kind, f.file_id, tags)
+        self.reload_from_store(keep_view=True)
+        MkMessage.success(
+            self,
+            f"已为「{files[0].file_name}」等 {len(files)} 个文件设置标签",
+        )
+
+    def _on_set_combo_tags(self, combo: dict) -> None:
+        """组合父行「设置标签…」：勾选集合替换该组合标签。"""
+        if not self.store or not combo:
+            return
+        dialog = TagDialog(
+            self.store, initial_tags=combo.get("tags", []), parent=self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.store.set_combo_tags(combo["combo_id"], dialog.selected_tags())
+        self.reload_from_store(keep_view=True)
+        MkMessage.success(self, f"已为组合「{combo['name']}」设置标签")
 
     def _on_rename_file(self, file_obj):
         """应用内单文件改名：组合身份/关联/金额/日期全部保留（不重扫、不 advance）。"""
@@ -1089,6 +1150,7 @@ class FileListPanel(QWidget):
 
             self._rebuild_children(item, f)           # 展开子行明细
             item.setText(COL_AMOUNT, self._format_amount(f))
+            self._set_tags_cell(item, getattr(latest, "tags", []))
             badge = self.tree.itemWidget(item, COL_STATUS)
             if badge:
                 linked, count, auto, dangling = self._link_state(f)
@@ -1104,6 +1166,7 @@ class FileListPanel(QWidget):
             if combo:
                 item.setText(COL_AMOUNT, self._format_combo_total(combo_id))
                 item.setText(COL_DATE, f"{len(combo['file_ids'])} 个成员")
+                self._set_tags_cell(item, combo.get("tags", []))
 
         self._apply_visibility()
         self._update_locate_status()
