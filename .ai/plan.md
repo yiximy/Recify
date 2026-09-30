@@ -647,3 +647,15 @@ def _on_confirm():
 - `app/ui/widgets/export_dialog.py`：新增对账行标签，随勾选实时刷新 `已确认支付总额（store.get_summary().total_amount）｜ 已勾选类别合计（get_tag_stats）｜ 未包含差额`；差额 > 0.005 用警示色并附「其中 未分类 N 张 ¥Z」，差额为 0 显示「已与已确认总额一致」；未分类默认勾选状态未改。
 - 验证：`_tmp_diag/codex_verify.py` 离屏 21 项断言全绿（zipfile+ElementTree 读回 mergeCells/列宽/单元格值；人类示例 D/E/F+G+I；组隔离；对账警示/归零；真实数据只读回归 8302.37 == 8302.37，46 处合并无跨组），`_tmp_diag/claude_verify7.py` 17/17 通过，`bash scripts/check.sh` 全绿；临时脚本用后清理。
 - 注：真实 `data/store.json` 现 `未分类 = 0 张 ¥0.00`（人类于 14:21 已给原 2 张发票打标签），故当前对账行显示「一致」；差额可见逻辑本身不依赖该快照。
+
+
+---
+
+## 2026-09-30 实现方案：「关联明细」按标签分组 + 组内按日期升序
+
+- `app/core/excel_export.py`：`build_detail_sheet(store, tags=None)` 新增组间顺序参数（None 默认取 `store.get_all_tags()`，与「费用报销表」同源）。新增 `_detail_group_key`（主分组键 = 发票标签优先，无则支付标签，都无则「未标注」；多标签取传入顺序中序号最靠前者；未在传入顺序中的标签排在已选标签之后、「未标注」之前）与 `_detail_sort_key`（组序号 → 组名 → 日期升序（发票票面日期，缺失回退支付日期；都缺失排组内末位）→ `(支付文件名, 发票文件名)`）。
+- 排序在构建行/展示文本之前完成（`pairs.sort`），随后才走 `_association_groups` + `_apply_group_merges`，落实「先排、后合并」。
+- `_association_groups(records, group_keys=None)` 增加主分组键约束：仅同键相邻行可归入同一关联组，确保标签分组边界处即使恰好共享支付/发票也**不跨组合并**（满足「已知取舍」而不写单点特判）。
+- `app/ui/pages/compare_page.py`：导出明细时传 `params["tags"]`（对话框勾选顺序），两张工作表组间顺序一致。
+- `README.md`：关联明细条目更新为新行为，并记录「同一支付被不同标签引用 → 排序后不相邻 → 不合并」的已知取舍。
+- 验证：`_tmp_diag/verify_detail_sort.py` 离屏断言（合成 3 标签 + 2 行无标签：同标签连续、组内日期单调不减、组间顺序 == 传入顺序、「未标注」在最后；同标签同日期 1 支付↔2 发票 D/E/F 合并；跨标签同支付不合并；9 列表头/列宽不变、日期无后缀），并对真实 `data/store.json` 只读回归；`bash scripts/check.sh` 全绿；临时脚本用后清理。
