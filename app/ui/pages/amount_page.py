@@ -2,6 +2,8 @@
 """金额计算页：OCR识别 + 金额编辑 + 汇总计算 + 实时预览 + 金额筛选 + 类型选择"""
 from __future__ import annotations
 
+import os
+
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -424,6 +426,22 @@ class AmountPage(QWidget):
 
     def _scan_and_load(self, folder: str):
         """扫描文件夹并加载文件列表。"""
+        if not folder or not os.path.isdir(folder):
+            # 目录不存在（被改名/移动/未挂载）：不扫描、不合并，
+            # 避免空扫描结果把全部记录标为 missing（看着像数据丢失）
+            self._files = []
+            self._filtered_files = []
+            self._path_to_fid = {}
+            self._populate_table()
+            self._update_summary()
+            self.btn_ocr.setEnabled(False)
+            self.btn_reocr.setEnabled(False)
+            self.btn_recalc_date.setEnabled(False)
+            MkMessage.warning(
+                self, f"文件夹不存在，未做任何改动：\n{folder}\n请重新选择文件夹。"
+            )
+            return
+
         if self._file_type == "image":
             files = FileScanner.scan_payments(folder)
             if self.store:

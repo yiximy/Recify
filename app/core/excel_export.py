@@ -10,7 +10,8 @@
 「费用报销表」。文本仍做 XML 转义，文件名含 ``& < > " '`` 也不会破坏文件。
 
 旧接口 ``build_association_rows`` / ``write_xlsx`` 保持可用；导出用的「关联明细」
-为 9 列（见 ``DETAIL_HEADERS``），同一关联组内取值相同的列纵向合并单元格。
+为 9 列（见 ``DETAIL_HEADERS``），先按标签分组、组内按日期升序排序，同一关联组内
+取值相同的列再纵向合并单元格。
 """
 from __future__ import annotations
 
@@ -187,11 +188,13 @@ def _file_tags(file, combo_tags: dict[str, list]) -> list:
     return merged
 
 
-def _association_groups(records: list) -> list:
+def _association_groups(records: list, group_keys: Optional[list] = None) -> list:
     """按「相邻行共享支付或发票 file_id」划分关联组，返回记录下标闭区间列表。
 
     相邻两行只要支付记录 file_id 相同或发票 file_id 相同即属同一组，因此
     「1 支付 ↔ N 发票」「1 发票 ↔ N 支付」两种方向都能形成连续分组。
+    ``group_keys`` 给出每行的主分组键时，仅同键相邻行才可归入同一组，
+    避免标签分组边界被共享的支付/发票打通（不得跨标签组合并）。
     """
     groups: list = []
     start = 0
@@ -202,6 +205,8 @@ def _association_groups(records: list) -> list:
             previous["payment"].file_id == current["payment"].file_id
             or previous["invoice"].file_id == current["invoice"].file_id
         )
+        if group_keys is not None and group_keys[index] != group_keys[index - 1]:
+            same_group = False
         if not same_group:
             groups.append((start, index - 1))
             start = index
@@ -233,13 +238,71 @@ def _apply_group_merges(rows: list, display: list, groups: list) -> list:
     return merges
 
 
-def build_detail_sheet(store) -> Sheet:
-    """关联明细工作表：9 列（无「关联方式」）、日期无来源后缀、组内同值列合并。"""
-    rows: list = [[Cell(text, "header") for text in DETAIL_HEADERS]]
+def _detail_group_key(rec, invoice_combo_tags, payment_combo_tags, tag_rank,
+                      unknown_rank, untagged_rank) -> tuple:
+    """主分组键 ``(组序号, 组名)``：发票标签优先，其次支付标签，都无则「未标注」。
+
+    文件可带多个标签，取 ``tag_rank`` 中序号最靠前（即传入标签顺序最靠前）的一个，
+    与「费用报销表」的类别顺序对齐；未在传入顺序中的标签统一排在已选标签之后，
+    「未标注」再居最后。
+    """
+    best: Optional[tuple] = None
+    for holder, combo_tags in ((rec["invoice"], invoice_combo_tags),
+                               (rec["payment"], payment_combo_tags)):
+        for tag in _file_tags(holder, combo_tags):
+            rank = tag_rank.get(tag, unknown_rank)
+            if best is None or (rank, tag) < best:
+                best = (rank, tag)
+        if best is not None:
+            break
+    return best if best is not None else (untagged_rank, "")
+
+
+def _detail_sort_key(store, rec, group_key) -> tuple:
+    """关联明细排序键：组序号 → 组名 → 日期升序 → (支付文件名, 发票文件名)。
+
+    日期取发票票面日期，缺失时回退支付日期；两者都缺的行排组内最后。
+    文件名参与排序保证同日稳定、可复现。
+    """
+    date_iso = (_date_text(store, rec["invoice"])
+                or _date_text(store, rec["payment"]))
+    return (
+        group_key[0],
+        group_key[1],
+        date_iso == "",
+        date_iso,
+        rec["payment"].file_name,
+        rec["invoice"].file_name,
+    )
+
+
+def build_detail_sheet(store, tags=None) -> Sheet:
+    """关联明细工作表：9 列（无「关联方式」）、日期无来源后缀、组内同值列合并。
+
+    先按标签分组、组内按日期升序排序，再计算合并（合并依赖相邻性）：
+    主分组键 = 发票标签（无则支付标签，都无则「未标注」固定最后）；``tags``
+    为组间顺序（默认 ``store.get_all_tags()``），导出时传入对话框勾选顺序，
+    与「费用报销表」保持一致；组内按日期升序（发票票面日期，缺失回退支付日期），
+    同日按 ``(支付记录文件名, 发票文件名)`` 稳定排序。
+    """
+    tag_order = list(tags) if tags is not None else store.get_all_tags()
+    tag_rank = {tag: index for index, tag in enumerate(tag_order)}
+    unknown_rank = len(tag_order)
+    untagged_rank = unknown_rank + 1
+
     invoice_combo_tags = _combo_tags(store, "invoice")
     payment_combo_tags = _combo_tags(store, "payment")
 
-    records = list(_association_records(store))
+    pairs = [
+        (_detail_group_key(rec, invoice_combo_tags, payment_combo_tags,
+                           tag_rank, unknown_rank, untagged_rank), rec)
+        for rec in _association_records(store)
+    ]
+    pairs.sort(key=lambda pair: _detail_sort_key(store, pair[1], pair[0]))
+    group_keys = [key for key, _rec in pairs]
+    records = [rec for _key, rec in pairs]
+
+    rows: list = [[Cell(text, "header") for text in DETAIL_HEADERS]]
     display: list = []
     for rec in records:
         invoice = rec["invoice"]
@@ -273,7 +336,8 @@ def build_detail_sheet(store) -> Sheet:
             payment_tags,
         ])
 
-    merges = _apply_group_merges(rows, display, _association_groups(records))
+    merges = _apply_group_merges(
+        rows, display, _association_groups(records, group_keys))
     return Sheet(
         name="关联明细",
         rows=rows,

@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import os
+
 from typing import Optional
 
 from PySide6.QtCore import Signal, Qt, QRect
@@ -334,6 +336,16 @@ class FileListPanel(QWidget):
 
     def _scan_and_load(self, folder: str):
         """扫描文件夹并加载文件列表。"""
+        if not folder or not os.path.isdir(folder):
+            # 目录不存在（被改名/移动/未挂载）：**不扫描、不合并**。
+            # 否则空扫描结果会把全部记录标为 missing，列表看着像"数据全没了"。
+            self._files = []
+            self._populate_tree([])
+            MkMessage.warning(
+                self, f"文件夹不存在，未做任何改动：\n{folder}\n请重新选择文件夹。"
+            )
+            return
+
         if self.kind == "invoice":
             files = FileScanner.scan_invoices(folder)
         else:

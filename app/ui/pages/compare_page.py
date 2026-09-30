@@ -421,7 +421,8 @@ class ComparePage(QWidget):
             )
             sheets = [summary]
             if params["include_detail"]:
-                sheets.append(build_detail_sheet(self.store))
+                # 明细表组间顺序与费用报销表一致（勾选顺序）
+                sheets.append(build_detail_sheet(self.store, params["tags"]))
             write_report(path, sheets)
         except OSError as exc:
             MkMessage.error(self, f"导出失败：{exc}")
