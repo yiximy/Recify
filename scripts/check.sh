@@ -28,6 +28,7 @@ echo "[2/3] 核心模块导入测试..."
 python -c "
 from app.core.models import InvoiceFile, PaymentFile, AmountRecord, Association, now_iso, generate_file_id
 from app.core.store import Store
+from app.core.pdf_date import labeled_invoice_date
 from app.core.amount_parser import AmountParser, AmountCandidate
 from app.core.file_scanner import FileScanner
 from app.core.pdf_renderer import PdfRenderer

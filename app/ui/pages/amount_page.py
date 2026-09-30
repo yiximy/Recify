@@ -20,6 +20,7 @@ from monkeyqt import MkButton, MkTable, MkCard, MkProgressBar, MkMessage, MkInpu
 
 from app.core.date_parser import parse_date_from_lines
 from app.core.file_scanner import FileScanner
+from app.core.pdf_date import labeled_invoice_date
 from app.ui.widgets.amount_edit_cell import AmountEditCell
 from app.ui.widgets.confirm_checkbox import ConfirmCheckBox
 from app.ui.widgets.date_edit_cell import DateEditCell
@@ -174,6 +175,14 @@ class AmountPage(QWidget):
         self.btn_reocr.setEnabled(False)
         self.btn_reocr.clicked.connect(self._on_reocr_unconfirmed)
         toolbar.addWidget(self.btn_reocr)
+
+        self.btn_recalc_date = MkButton("重算票面日期", type="default")
+        self.btn_recalc_date.setEnabled(False)
+        self.btn_recalc_date.setToolTip(
+            "按 PDF 文本层重算发票票面日期（跳过手动设置与纯图片 PDF）"
+        )
+        self.btn_recalc_date.clicked.connect(self._on_recalc_document_dates)
+        toolbar.addWidget(self.btn_recalc_date)
 
         layout.addLayout(toolbar)
 
@@ -402,6 +411,7 @@ class AmountPage(QWidget):
                 self._update_summary()
                 self.btn_ocr.setEnabled(False)
                 self.btn_reocr.setEnabled(False)
+                self.btn_recalc_date.setEnabled(False)
 
     # ── 文件夹与扫描 ────────────────────────────────────────
 
@@ -433,6 +443,9 @@ class AmountPage(QWidget):
         has_files = len(files) > 0
         self.btn_ocr.setEnabled(has_files and self._ocr_worker is None)
         self.btn_reocr.setEnabled(has_files and self._ocr_worker is None)
+        self.btn_recalc_date.setEnabled(
+            has_files and self._file_type != "image" and self._ocr_worker is None
+        )
 
     # ── 金额筛选 ──────────────────────────────────────────
 
@@ -748,6 +761,7 @@ class AmountPage(QWidget):
         self.lbl_status.setText("准备中...")
         self.btn_ocr.setEnabled(False)
         self.btn_reocr.setEnabled(False)
+        self.btn_recalc_date.setEnabled(False)
 
         self._ocr_worker = OcrWorker(paths, file_type=self._file_type)
         self._ocr_worker.progress.connect(self._on_ocr_progress)
@@ -762,7 +776,7 @@ class AmountPage(QWidget):
         self.lbl_status.setText(f"({current}/{total}) {message}")
 
     def _persist_ocr_document_date(self, file_id: str, raw_texts: list[str]) -> None:
-        """解析 OCR 日期并落库；手动日期优先，解析失败保持原值。"""
+        """解析票面日期并落库；文本层优先，OCR 文本回退，手动日期不覆盖。"""
         if not self.store:
             return
         kind = "payments" if self._file_type == "image" else "invoices"
@@ -772,7 +786,15 @@ class AmountPage(QWidget):
         if current is not None and \
                 getattr(current, "document_date_source", "") == "manual":
             return
-        document_date = parse_date_from_lines(raw_texts)
+        # 发票 PDF 自带精确文本层，优先读取以免受 OCR 数字误读影响
+        document_date = ""
+        if self._file_type != "image":
+            abs_path = getattr(current, "abs_path", "") if current else ""
+            if abs_path:
+                document_date = labeled_invoice_date(abs_path)
+        # 纯图片 PDF / 无标签版面：回退 OCR 文本解析
+        if not document_date:
+            document_date = parse_date_from_lines(raw_texts) or ""
         if not document_date:
             return
         self.store.set_document_date(kind, file_id, document_date, "ocr")
@@ -855,8 +877,24 @@ class AmountPage(QWidget):
         self.lbl_status.setVisible(False)
         self.btn_ocr.setEnabled(len(self._files) > 0)
         self.btn_reocr.setEnabled(len(self._files) > 0)
+        self.btn_recalc_date.setEnabled(
+            len(self._files) > 0 and self._file_type != "image"
+        )
         self._ocr_worker = None
         self._update_summary()
+
+    def _on_recalc_document_dates(self):
+        """按 PDF 文本层重算发票票面日期（跳过手动与纯图片 PDF）。"""
+        if not self.store or self._file_type == "image":
+            return
+        total, updated, skipped = self.store.recalculate_invoice_document_dates()
+        self._reload_files_from_store()
+        self._apply_filter_and_populate()
+        self._update_summary()
+        MkMessage.success(
+            self,
+            f"已重算 {total} 张（更新 {updated} 张，跳过 {skipped} 张手动）",
+        )
 
     # ── 编辑与确认 ──────────────────────────────────────────
 

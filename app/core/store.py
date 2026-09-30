@@ -18,6 +18,7 @@ from .rename_plan import (
 )
 from .file_identity import plan_rename_adoptions
 from .tag_stats import build_tag_stats
+from .pdf_date import labeled_invoice_date
 
 
 def _parse_iso_date(value: str):
@@ -549,6 +550,37 @@ class Store:
             entry["document_date_source"] = source or ""
             self._save()
             self._notify()
+
+    def recalculate_invoice_document_dates(self) -> tuple[int, int, int]:
+        """按 PDF 文本层重算发票票面日期，修复 OCR 误读的存量数据。
+
+        跳过 missing 记录与 ``document_date_source == "manual"`` 的手动日期；
+        纯图片 PDF（文本层无「开票日期」）跳过。仅在有更新时保存一次。
+
+        Returns:
+            ``(扫描总数, 更新数, 跳过手动数)``。
+        """
+        with self._lock:
+            total = 0
+            updated = 0
+            skipped_manual = 0
+            for entry in self._data["invoices"].values():
+                if entry.get("missing"):
+                    continue
+                total += 1
+                if (entry.get("document_date_source") or "") == "manual":
+                    skipped_manual += 1
+                    continue
+                path = entry.get("abs_path") or ""
+                date_iso = labeled_invoice_date(path) if path else ""
+                if date_iso and date_iso != (entry.get("document_date") or ""):
+                    entry["document_date"] = date_iso
+                    entry["document_date_source"] = "ocr"
+                    updated += 1
+            if updated:
+                self._save()
+                self._notify()
+            return total, updated, skipped_manual
 
     @staticmethod
     def get_document_date(file: object) -> tuple[str, str]:
