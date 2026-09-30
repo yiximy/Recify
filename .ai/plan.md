@@ -637,3 +637,13 @@ def _on_confirm():
 - ???`excel_export` ??????? + ???? + ??? + SUM ????????? zipfile + XML???? `Cell/Sheet/write_report`?`build_summary_sheet`?`build_detail_sheet`??? `build_association_rows` / `write_xlsx` ????
 - UI??? `tag_dialog.py` / `export_dialog.py`?`file_list_panel` ???????COL_TAGS=4?????? 5?????????????????? / ??????`compare_page` ?????????????????
 - ???`_tmp_diag` ?? 47 ??????CRUD / ?? / ???? / ???? / xlsx ?????????`scripts/check.sh` ???
+
+
+---
+
+## 2026-09-30 实现：关联明细表改版（去列/去后缀/组内合并）+ 导出对账行
+
+- `app/core/excel_export.py`：新增 `DETAIL_HEADERS`（9 列，无「关联方式」），`DETAIL_COL_WIDTHS` 去掉原关联方式列宽；`_date_text` 只返回 `YYYY-MM-DD`（删 `_DATE_SOURCE_LABELS`）；新增 `_amount_display`、`_association_groups`（相邻行共享支付/发票 file_id 成组）、`_apply_group_merges`（组内同值且非空的列合并、非左上角置空），`build_detail_sheet` 改为写 9 列 + `merges`。旧接口 `build_association_rows` / `write_xlsx` 仍可用。
+- `app/ui/widgets/export_dialog.py`：新增对账行标签，随勾选实时刷新 `已确认支付总额（store.get_summary().total_amount）｜ 已勾选类别合计（get_tag_stats）｜ 未包含差额`；差额 > 0.005 用警示色并附「其中 未分类 N 张 ¥Z」，差额为 0 显示「已与已确认总额一致」；未分类默认勾选状态未改。
+- 验证：`_tmp_diag/codex_verify.py` 离屏 21 项断言全绿（zipfile+ElementTree 读回 mergeCells/列宽/单元格值；人类示例 D/E/F+G+I；组隔离；对账警示/归零；真实数据只读回归 8302.37 == 8302.37，46 处合并无跨组），`_tmp_diag/claude_verify7.py` 17/17 通过，`bash scripts/check.sh` 全绿；临时脚本用后清理。
+- 注：真实 `data/store.json` 现 `未分类 = 0 张 ¥0.00`（人类于 14:21 已给原 2 张发票打标签），故当前对账行显示「一致」；差额可见逻辑本身不依赖该快照。
