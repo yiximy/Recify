@@ -9,7 +9,8 @@
 （``<v>``），合计行写 ``SUM`` 公式（同时带缓存值），列宽/行高/合并对齐模板
 「费用报销表」。文本仍做 XML 转义，文件名含 ``& < > " '`` 也不会破坏文件。
 
-旧接口 ``build_association_rows`` / ``write_xlsx`` 保持可用（关联明细由前者派生）。
+旧接口 ``build_association_rows`` / ``write_xlsx`` 保持可用；导出用的「关联明细」
+为 9 列（见 ``DETAIL_HEADERS``），同一关联组内取值相同的列纵向合并单元格。
 """
 from __future__ import annotations
 
@@ -17,20 +18,24 @@ import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# 关联明细表头（列顺序即导出列顺序）
+# 旧接口 build_association_rows 的表头（8 列，含「关联方式」）
 HEADERS = [
     "发票文件名", "发票金额", "发票日期",
     "支付记录文件名", "支付金额", "支付日期",
     "所属组合", "关联方式",
 ]
 
+# 关联明细工作表表头（9 列，无「关联方式」；列顺序即导出列顺序）
+DETAIL_HEADERS = [
+    "发票文件名", "发票金额", "发票日期",
+    "支付记录文件名", "支付金额", "支付日期",
+    "所属组合", "发票标签", "支付标签",
+]
+
 # 费用报销表布局（对齐参考模板，列宽容差 0.1）
 SUMMARY_HEADERS = ["序号", "日期", "摘要", "票据张数", "金额", "备注"]
 SUMMARY_COL_WIDTHS = (9, 20.48, 42.89, 11.56, 17.11, 25.18)
-DETAIL_COL_WIDTHS = (30, 12, 20, 30, 12, 20, 24, 10, 22, 22)
-
-# 日期来源的中文后缀标签
-_DATE_SOURCE_LABELS = {"ocr": "票面", "manual": "手动", "file": "文件"}
+DETAIL_COL_WIDTHS = (30, 12, 20, 30, 12, 20, 24, 22, 22)
 
 # 具名样式 -> cellXfs 索引（与 _STYLES_XML 中顺序一致）
 STYLE_INDEX = {
@@ -77,19 +82,20 @@ def _amount_value(file) -> Optional[float]:
     return amount.final_amount
 
 
-def _amount_text(file) -> str:
-    """金额列文本：``final_amount`` 保留 2 位，无金额返回空串。"""
-    value = _amount_value(file)
+def _amount_display(value: Optional[float]) -> str:
+    """金额显示文本：保留 2 位；无金额返回空串（与 number 样式显示一致）。"""
     return "" if value is None else f"{value:.2f}"
 
 
+def _amount_text(file) -> str:
+    """金额列文本：``final_amount`` 保留 2 位，无金额返回空串。"""
+    return _amount_display(_amount_value(file))
+
+
 def _date_text(store, file) -> str:
-    """日期列文本：ISO 日期 + 来源后缀（票面/手动/文件）。"""
-    date_iso, source = store.get_document_date(file)
-    if not date_iso:
-        return ""
-    label = _DATE_SOURCE_LABELS.get(source, "")
-    return f"{date_iso}（{label}）" if label else date_iso
+    """日期列文本：仅 ``YYYY-MM-DD``（不含来源后缀）。"""
+    date_iso, _source = store.get_document_date(file)
+    return date_iso or ""
 
 
 def _combo_name_map(store) -> dict[str, str]:
@@ -181,30 +187,97 @@ def _file_tags(file, combo_tags: dict[str, list]) -> list:
     return merged
 
 
+def _association_groups(records: list) -> list:
+    """按「相邻行共享支付或发票 file_id」划分关联组，返回记录下标闭区间列表。
+
+    相邻两行只要支付记录 file_id 相同或发票 file_id 相同即属同一组，因此
+    「1 支付 ↔ N 发票」「1 发票 ↔ N 支付」两种方向都能形成连续分组。
+    """
+    groups: list = []
+    start = 0
+    for index in range(1, len(records)):
+        previous = records[index - 1]
+        current = records[index]
+        same_group = (
+            previous["payment"].file_id == current["payment"].file_id
+            or previous["invoice"].file_id == current["invoice"].file_id
+        )
+        if not same_group:
+            groups.append((start, index - 1))
+            start = index
+    if records:
+        groups.append((start, len(records) - 1))
+    return groups
+
+
+def _apply_group_merges(rows: list, display: list, groups: list) -> list:
+    """组内同值且非空的列纵向合并：置空非左上角单元格，返回 mergeCell 引用。
+
+    ``rows`` 第 0 行为表头，记录下标 i 对应 Excel 第 i+2 行；``display`` 为每行
+    的显示文本（金额已格式化、日期已去后缀），据其判断组内取值是否完全相同。
+    不同组之间绝不合并，单行组不产生合并。
+    """
+    merges: list = []
+    for start, end in groups:
+        if end <= start:
+            continue
+        for column in range(len(DETAIL_HEADERS)):
+            values = [display[i][column] for i in range(start, end + 1)]
+            head = values[0]
+            if not head or any(value != head for value in values):
+                continue
+            letter = _col_letter(column)
+            merges.append(f"{letter}{start + 2}:{letter}{end + 2}")
+            for i in range(start + 1, end + 1):
+                rows[i + 1][column] = Cell(None, rows[i + 1][column].style)
+    return merges
+
+
 def build_detail_sheet(store) -> Sheet:
-    """关联明细工作表：``build_association_rows`` 内容 + 发票/支付两列标签。"""
-    headers = list(HEADERS) + ["发票标签", "支付标签"]
-    rows: list = [[Cell(text, "header") for text in headers]]
+    """关联明细工作表：9 列（无「关联方式」）、日期无来源后缀、组内同值列合并。"""
+    rows: list = [[Cell(text, "header") for text in DETAIL_HEADERS]]
     invoice_combo_tags = _combo_tags(store, "invoice")
     payment_combo_tags = _combo_tags(store, "payment")
-    for rec in _association_records(store):
+
+    records = list(_association_records(store))
+    display: list = []
+    for rec in records:
         invoice = rec["invoice"]
         payment = rec["payment"]
+        invoice_amount = _amount_value(invoice)
+        payment_amount = _amount_value(payment)
+        invoice_date = _date_text(store, invoice)
+        payment_date = _date_text(store, payment)
+        invoice_tags = "、".join(_file_tags(invoice, invoice_combo_tags))
+        payment_tags = "、".join(_file_tags(payment, payment_combo_tags))
         rows.append([
             Cell(invoice.file_name, "text"),
-            Cell(_amount_value(invoice), "number"),
-            Cell(_date_text(store, invoice), "center"),
+            Cell(invoice_amount, "number"),
+            Cell(invoice_date, "center"),
             Cell(payment.file_name, "text"),
-            Cell(_amount_value(payment), "number"),
-            Cell(_date_text(store, payment), "center"),
+            Cell(payment_amount, "number"),
+            Cell(payment_date, "center"),
             Cell(rec["combo"], "text"),
-            Cell("自动" if rec["auto"] else "手动", "center"),
-            Cell("、".join(_file_tags(invoice, invoice_combo_tags)), "text"),
-            Cell("、".join(_file_tags(payment, payment_combo_tags)), "text"),
+            Cell(invoice_tags, "text"),
+            Cell(payment_tags, "text"),
         ])
+        display.append([
+            invoice.file_name,
+            _amount_display(invoice_amount),
+            invoice_date,
+            payment.file_name,
+            _amount_display(payment_amount),
+            payment_date,
+            rec["combo"],
+            invoice_tags,
+            payment_tags,
+        ])
+
+    merges = _apply_group_merges(rows, display, _association_groups(records))
     return Sheet(
         name="关联明细",
         rows=rows,
+        merges=tuple(merges),
         col_widths=DETAIL_COL_WIDTHS,
         row_heights={1: 22},
     )

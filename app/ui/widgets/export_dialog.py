@@ -2,7 +2,8 @@
 """导出 Excel 对话框：选标签类别、未分类、报销单位、是否含明细表。
 
 预览数据来自 ``Store.get_tag_stats()``（与导出生成共用同一份口径）；
-「费用报销期间」为当前勾选类别涵盖数据的整体日期区间（只读）。
+「费用报销期间」为当前勾选类别涵盖数据的整体日期区间（只读）；
+「对账行」实时展示 已确认支付总额 / 已勾选类别合计 / 未包含差额。
 """
 from __future__ import annotations
 
@@ -12,6 +13,10 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QVBoxLayout,
 )
 from monkeyqt import MkButton, MkInput, MkMessage
+
+# 对账行文字颜色（沿用 Elegant Light 的次要文字色与警示色）
+_RECONCILE_OK_COLOR = "#606266"
+_RECONCILE_WARN_COLOR = "#E6A23C"
 
 
 class ExportDialog(QDialog):
@@ -60,6 +65,13 @@ class ExportDialog(QDialog):
         self.chk_untagged = QCheckBox("包含未分类票据")
         layout.addWidget(self.chk_untagged)
 
+        self.lbl_reconcile = QLabel("")
+        self.lbl_reconcile.setWordWrap(True)
+        self.lbl_reconcile.setStyleSheet(
+            f"color: {_RECONCILE_OK_COLOR}; font-size: 12px;"
+        )
+        layout.addWidget(self.lbl_reconcile)
+
         unit_row = QHBoxLayout()
         unit_row.addWidget(QLabel("报销单位："))
         default_unit = ""
@@ -88,16 +100,20 @@ class ExportDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self.list_tags.itemChanged.connect(lambda _item: self._update_period())
-        self.chk_untagged.toggled.connect(lambda _state: self._update_period())
-        self._update_period()
+        self.list_tags.itemChanged.connect(
+            lambda _item: self._on_selection_changed()
+        )
+        self.chk_untagged.toggled.connect(
+            lambda _state: self._on_selection_changed()
+        )
+        self._on_selection_changed()
 
     # ── 交互 ────────────────────────────────────────────────
 
     def _set_all(self, state) -> None:
         for i in range(self.list_tags.count()):
             self.list_tags.item(i).setCheckState(state)
-        self._update_period()
+        self._on_selection_changed()
 
     def selected_tags(self) -> list:
         """返回勾选的标签类别名（列表顺序）。"""
@@ -126,6 +142,47 @@ class ExportDialog(QDialog):
         else:
             period = ""
         self.lbl_period.setText(f"费用报销期间：{period or '—'}")
+
+    def _update_reconcile(self) -> None:
+        """对账行：已确认总额 ｜ 已勾选合计 ｜ 未包含差额（实时随勾选变化）。
+
+        已确认总额取 ``store.get_summary()["total_amount"]``（与计算金额模式
+        同口径，不另算）；已勾选合计取 ``store.get_tag_stats()`` 中当前勾选类别
+        （含勾选未分类时）的金额和。差额 > 0.005 显示警示色；未勾选未分类且
+        存在未分类票据时，追加其张数与金额。
+        """
+        if not self.store:
+            self.lbl_reconcile.setText("")
+            return
+        total = float(self.store.get_summary().get("total_amount") or 0.0)
+        selected = sum(
+            float(cat.get("amount") or 0.0)
+            for cat in self._selected_categories()
+        )
+        diff = round(total - selected, 2)
+        untagged = self._stats.get("untagged") or {}
+        untagged_count = int(untagged.get("count") or 0)
+        untagged_amount = float(untagged.get("amount") or 0.0)
+
+        text = (f"已确认支付总额 ¥{total:.2f} ｜ "
+                f"已勾选类别合计 ¥{selected:.2f} ｜ "
+                f"未包含 ¥{diff:.2f}")
+        if abs(diff) > 0.005:
+            color = _RECONCILE_WARN_COLOR
+            # 差额非零时才提示可能的来源（未分类票据未勾选）
+            if not self.chk_untagged.isChecked() and untagged_count > 0:
+                text += (f"（其中 未分类 {untagged_count} 张 "
+                         f"¥{untagged_amount:.2f}）")
+        else:
+            color = _RECONCILE_OK_COLOR
+            text += "，已与已确认总额一致"
+        self.lbl_reconcile.setText(text)
+        self.lbl_reconcile.setStyleSheet(f"color: {color}; font-size: 12px;")
+
+    def _on_selection_changed(self) -> None:
+        """勾选变化时同时刷新费用报销期间与对账行。"""
+        self._update_period()
+        self._update_reconcile()
 
     def accept(self):
         if not self.selected_tags() and not self.chk_untagged.isChecked():
